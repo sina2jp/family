@@ -117,11 +117,11 @@
     var jmsg = h('p.msg');
     main.appendChild(h('section.card.hero', null,
       h('h2', { text: 'Set up our family' }),
-      h('p', { text: 'One place for the PIN, rewards, setup codes, the AI key and the look of all four apps. His laptop picks it all up after one link. You see his week here.' }),
+      h('p', { text: 'One place for the PIN, rewards, setup codes, the AI key and the look of all four apps. Each of his laptops picks it all up after one link. You see his week here.' }),
       h('label.lbl', { text: 'Family backend address (the web app URL from DEPLOY.md, ends with /exec)' }), input, btn, msg,
       stash.importText ? h('p.note', { text: 'Your private setup codes are ready. They are imported right after setup.' }) : null));
     main.appendChild(h('details.card.small', null, h('summary', { text: 'Already set up on another laptop?' }),
-      h('p', { text: 'Paste your family link (Connect his laptop › link) to make this browser a second grown-up device.' }), join,
+      h('p', { text: 'Paste your family link (Connect each laptop › link) to make this browser a second grown-up device.' }), join,
       h('button.btn', { text: 'Connect as a grown-up', on: { click: function () {
         var j = FS.parseJoin(join.value);
         if (!j) { jmsg.textContent = 'That is not a family link.'; return; }
@@ -139,17 +139,23 @@
     { id: 'codes', title: 'Private setup codes', icon: 'lesson_scroll' },
     { id: 'ai', title: 'AI key (optional)', icon: 'ocarina_fairy' },
     { id: 'look', title: 'One look for all apps', icon: 'heart_container' },
-    { id: 'connect', title: 'Connect his laptop', icon: 'compass' },
+    { id: 'connect', title: 'Connect each laptop he uses', icon: 'compass' },
   ];
-  function kidDevices() { return (FS.mirror().devices || []).filter(function (d) { return d.role === 'kid' && !/^check-deploy/.test(d.id); }); }
+  // ---------- his laptops (several are fine since 1.1) ----------
+  function devMeta() { var m = readJSON(K.devices || 'familyApps.devices.v1') || {}; m.names = m.names || {}; m.removed = m.removed || {}; return m; }
+  function removedNow(d, meta) { var r = meta.removed[d.id]; return !!r && !(Date.parse(d.lastSeen || '') > Date.parse(r)); }
+  function allKids() { return (FS.mirror().devices || []).filter(function (d) { return d.role === 'kid' && !/^check-deploy/.test(d.id); }).sort(function (a, b) { return String(a.firstSeen).localeCompare(String(b.firstSeen)); }); }
+  function kidDevices() { var meta = devMeta(); return allKids().filter(function (d) { return !removedNow(d, meta); }); }
+  function labelOf(d) { var meta = devMeta(), all = allKids(), i = -1; for (var j = 0; j < all.length; j++) if (all[j].id === d.id) i = j; return meta.names[d.id] || 'Laptop ' + (i >= 0 ? i + 1 : all.length + 1); }
+  function newest(list) { return list.slice().sort(function (a, b) { return Date.parse(b.lastSeen || 0) - Date.parse(a.lastSeen || 0); })[0]; }
   function stepState(id) {
     var p = prefs();
     if (id === 'pin') return FS.pinIsSet() ? { done: true, text: 'Set · unlocks the grown-up corner in every app' } : { done: false, text: 'Not set yet' };
     if (id === 'rewards') { var r = readJSON(K.rewards); if (!r) return { done: false, text: 'Using the default list' }; var pet = (r.rewards || []).some(function (x) { return /our pet/i.test(x.text); }); return { done: true, text: (r.rewards || []).length + ' rewards · up to ' + r.weeklyCap + ' a week' + (pet ? ' · rename the pet reward' : ''), warn: pet }; }
     if (id === 'codes') { var a = readJSON('mathArena.v3.schoolSync.v1'), b = readJSON('musicQuest.myLessons.v1'); if (a || b) return { done: true, text: [a ? 'Math school sync ✔' : null, b ? 'Music lessons ✔' : null].filter(Boolean).join(' · ') }; return p.skipped.codes ? { done: true, text: 'Skipped for now' } : { done: false, text: 'Paste the MA1: / MQ1: codes' }; }
-    if (id === 'ai') { var key = raw(K.aiKey) || ''; return key ? { done: true, text: 'Saved · encrypted on the way to his laptop' } : p.skipped.ai ? { done: true, text: 'Skipped (apps work without it)' } : { done: false, text: 'Optional: for the AI helpers' }; }
+    if (id === 'ai') { var key = raw(K.aiKey) || ''; return key ? { done: true, text: 'Saved · encrypted on the way to his laptops' } : p.skipped.ai ? { done: true, text: 'Skipped (apps work without it)' } : { done: false, text: 'Optional: for the AI helpers' }; }
     if (id === 'look') { var l = FS.look(); return l ? { done: true, text: l === 'grove' ? 'Starlit Grove' : 'Hyrule' } : { done: false, text: 'Hyrule unless you choose' }; }
-    if (id === 'connect') { var k = kidDevices(); return k.length ? { done: true, text: 'Connected · ' + k[0].name + ' · seen ' + ago(k[0].lastSeen) } : { done: false, text: 'Open one link on his laptop' }; }
+    if (id === 'connect') { var k = kidDevices(), n = newest(k); return k.length ? { done: true, text: k.length + (k.length === 1 ? ' laptop' : ' laptops') + ' connected · last used ' + ago(n.lastSeen) } : { done: false, text: 'Open one link on each laptop he uses' }; }
     return { done: false, text: '' };
   }
   function renderHub() {
@@ -195,14 +201,14 @@
       h('div.row', null, a, b, h('button.btn.primary', { text: FS.pinIsSet() ? 'Change PIN' : 'Save PIN', on: { click: function () {
         if (!/^\d{4}$/.test(a.value)) { say('pin', 'Use 4 digits.', true); return route(); }
         if (a.value !== b.value) { say('pin', 'The two PINs are different.', true); return route(); }
-        FS.setPin(a.value).then(function () { say('pin', 'Saved. His laptop gets it on the next sync.'); ui.open = next('pin'); route(); }, function (e) { say('pin', e.message, true); route(); });
+        FS.setPin(a.value).then(function () { say('pin', 'Saved. His laptops get it on their next sync.'); ui.open = next('pin'); route(); }, function (e) { say('pin', e.message, true); route(); });
       } } })), msgFor('pin')];
   }
   function next(id) { for (var i = 0; i < STEPS.length; i++) if (STEPS[i].id === id) { for (var j = i + 1; j < STEPS.length; j++) if (!stepState(STEPS[j].id).done) return STEPS[j].id; } return ''; }
   function currentRewards() {
     var r = readJSON(K.rewards), ws = (r && r.wallet) || {};
     var list = (r && Array.isArray(r.rewards) && r.rewards.length ? r.rewards : FW.DEFAULT_REWARDS).map(function (x) { return { id: x.id, emoji: x.emoji, text: x.text, cost: (ws.costs && ws.costs[x.id]) || 1 }; });
-    return { list: list, weeklyCap: r && r.weeklyCap != null ? r.weeklyCap : 5, appsInSet: ws.appsInSet || FW.DEFAULT_SETTINGS.appsInSet.slice(), per: (ws.perApp && ws.perApp.math) || 3 };
+    return { list: list, weeklyCap: r && r.weeklyCap != null ? r.weeklyCap : 5, appsInSet: ws.appsInSet || FW.DEFAULT_SETTINGS.appsInSet.slice(), per: (ws.perApp && ws.perApp.math) || 3, noRepeats: ws.noRepeats !== false, onceDailyCap: ws.onceDailyCap != null ? ws.onceDailyCap : 6 };
   }
   function rewardsBody() {
     var cur = ui.rewardsDraft || (ui.rewardsDraft = currentRewards());
@@ -226,7 +232,17 @@
       cur.list.length < 8 ? h('button.btn.link', { text: '+ Add a reward', on: { click: function () { cur.list.push({ id: 'r' + Date.now().toString(36), emoji: '🎁', text: 'New reward', cost: 1 }); route(); } } }) : null,
       h('div.row.wrap', null, h('label.lbl.inline', null, 'Tickets per week (all apps): ', cap), h('label.lbl.inline', null, 'Shards from each app per Triforce: ', per)),
       h('p.lbl', { text: 'Apps that count toward a Triforce' }), apps,
+      h('div.policy', null,
+        h('label.check.big', null, h('input', { type: 'checkbox', id: 'norepeats', checked: cur.noRepeats, on: { change: function (e) { cur.noRepeats = e.target.checked; } } }), h('b', { text: 'Rewards only for new learning (no repeats)' })),
+        h('label.lbl.inline', null, 'Max lesson shards per app per day: ', h('input.inp.num', { type: 'number', min: 0, max: 50, value: cur.onceDailyCap, 'aria-label': 'Max lesson shards per app per day', id: 'oncecap', on: { input: function (e) { cur.onceDailyCap = Number(e.target.value); } } })),
+        h('p.small.muted', { text: policyText(cur.noRepeats, cur.onceDailyCap) })),
       h('div.row', null, h('button.btn.primary', { text: 'Save rewards', on: { click: saveRewards } })), msgFor('rewards')];
+  }
+  function policyText(on, cap) {
+    var c = Math.max(0, Math.round(Number(cap) || 0));
+    return on
+      ? 'Applied policy: a lesson he passes pays once, on any of his laptops; at most ' + c + ' lesson shards per app per day (more are saved and paid on later days); a correct answer pays once per question every 30 days; review time counts as minutes but earns no shards. Apps not yet updated keep the old rules until they are.'
+      : 'Applied policy: repeats pay again; still at most ' + c + ' lesson shards per app per day (more are saved for later days).';
   }
   function saveRewards() {
     var cur = ui.rewardsDraft;
@@ -237,7 +253,7 @@
     APPS.forEach(function (a) { perApp[a.id] = per; });
     cur.list.forEach(function (r) { costs[String(r.id).slice(0, 40)] = Math.max(1, Math.min(5, r.cost || 1)); });
     var old = readJSON(K.rewards) || {};
-    FS.setSetting(K.rewards, { version: 1, enabled: old.enabled !== false, tokensPerTicket: old.tokensPerTicket || 3, weeklyCap: Math.max(0, Math.min(14, Math.round(cur.weeklyCap))), rewards: list, updatedAt: new Date().toISOString(), wallet: { mode: 'balanced', appsInSet: cur.appsInSet.slice(), perApp: perApp, costs: costs } });
+    FS.setSetting(K.rewards, { version: 1, enabled: old.enabled !== false, tokensPerTicket: old.tokensPerTicket || 3, weeklyCap: Math.max(0, Math.min(14, Math.round(cur.weeklyCap))), rewards: list, updatedAt: new Date().toISOString(), wallet: { mode: 'balanced', appsInSet: cur.appsInSet.slice(), perApp: perApp, costs: costs, noRepeats: cur.noRepeats !== false, onceDailyCap: Math.max(0, Math.min(50, Math.round(Number(cur.onceDailyCap)))) } });
     ui.rewardsDraft = null;
     say('rewards', /our pet/i.test(JSON.stringify(list)) ? 'Saved. Tip: rename "Play time with our pet".' : 'Saved for all 4 apps.');
     ui.open = /our pet/i.test(JSON.stringify(list)) ? 'rewards' : next('rewards');
@@ -274,7 +290,7 @@
     var cur = raw(K.aiKey) || '';
     var inp = h('input.inp', { type: 'password', value: ui.aiDraft || '', placeholder: cur ? 'sk-ant-… (saved; paste a new one to replace)' : 'sk-ant-…', autocomplete: 'off', 'aria-label': 'Anthropic API key', spellcheck: false, on: { input: function (e) { ui.aiDraft = e.target.value; } } });
     var res = ui.test ? h('p.msg' + (ui.test.ok ? '' : '.bad'), { text: ui.test.ok ? (ui.test.preview ? 'Preview: on the real page this calls api.anthropic.com/v1/models.' : 'Key works ✔ (' + ui.test.n + ' models)') : 'Key test failed: ' + ui.test.text }) : null;
-    return [h('p', { text: 'Optional. The AI helpers in the apps use it. Use a key from its own Console workspace with a low monthly spend limit. It travels to his laptop encrypted with your family secret; the Sheet only holds ciphertext.' }),
+    return [h('p', { text: 'Optional. The AI helpers in the apps use it. Use a key from its own Console workspace with a low monthly spend limit. It travels to his laptops encrypted with your family secret; the Sheet only holds ciphertext.' }),
       h('div.row', null, inp,
         h('button.btn', { text: 'Test key', on: { click: function () { var k = inp.value.trim() || cur; if (!k) return; ui.test = { ok: true, text: '…' }; testKey(k).then(function (r) { ui.test = r; route(); }); } } }),
         h('button.btn.primary', { text: 'Save key', on: { click: function () { var k = inp.value.trim(); if (!/^sk-/.test(k)) { say('ai', 'That does not look like an Anthropic key (sk-…).', true); return route(); } FS.setSetting(K.aiKey, k); ui.test = null; ui.aiDraft = ''; say('ai', 'Saved. His laptop gets it encrypted.'); ui.open = next('ai'); route(); } } })),
@@ -297,7 +313,7 @@
     var pair = ui.pair;
     var left = pair ? Math.max(0, Math.round((Date.parse(pair.expiresAt) - Date.now()) / 1000)) : 0;
     if (pair && left > 0 && !ui.pairTimer) ui.pairTimer = setInterval(function () { var el = document.getElementById('pairleft'); if (!ui.pair || !el) { clearInterval(ui.pairTimer); ui.pairTimer = null; return; } var s = Math.max(0, Math.round((Date.parse(ui.pair.expiresAt) - Date.now()) / 1000)); el.textContent = s ? Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2) + ' left' : 'expired'; }, 1000);
-    return [h('p', { text: 'On his laptop, open this link once in Chrome (about 30 seconds). It saves the family connection for all 4 apps, keeps his progress, brings over everything you set here, and asks for the microphone once. Nothing else is ever needed there.' }),
+    return [h('p', { text: 'Open this link once on each laptop he uses, in Chrome (about 30 seconds each). It connects all 4 apps on that laptop, keeps what he already did there, brings over everything you set here, and asks for the microphone once. After that, any of his laptops just works: his progress follows him.' }),
       h('div.connect', null, h('div', null, field,
         h('div.row', null, h('button.btn.primary', { text: 'Copy link', on: { click: function () { (navigator.clipboard ? navigator.clipboard.writeText(link) : Promise.reject()).then(function () { say('connect', 'Copied. Send it to his laptop (Messages, AirDrop, or an email to yourself).'); route(); }, function () { field.select(); say('connect', 'Select the link and copy it.'); route(); }); } } }),
           h('button.btn', { text: pair && left > 0 ? 'New code' : 'Show a 6-character code', on: { click: function () { FS.pairCreate().then(function (p) { ui.pair = p; route(); }, function (e) { say('connect', (e && e.message) || 'Could not make a code.', true); route(); }); } } })),
@@ -328,6 +344,7 @@
     var sec = h('section.dash', { id: 'dashboard' });
     var m = FS.mirror(), has = !!m.items[K.wallet] || !!m.items[K.walletTime];
     sec.appendChild(h('div.sechead', null, h('h2', { text: 'This week' }), h('small', { text: m.at ? 'Updated ' + ago(m.at) : '' })));
+    alerts().forEach(function (a) { sec.appendChild(a); });
     if (!has && !kidDevices().length) { sec.appendChild(h('div.card.empty', { text: 'His week shows up here after his laptop is connected (step 6).' })); return sec; }
     var rep = withMirror(function () { return FW.weeklyReport(0); }) || { apps: {} };
     var table = h('div.week');
@@ -347,6 +364,26 @@
     sec.appendChild(walletCard());
     sec.appendChild(h('div.two', null, codesCard(), devicesCard()));
     return sec;
+  }
+  var DAY = 86400000;
+  function appOfKey(k) { var m = /^(mathArena|langQuest|codeQuest|musicQuest)\./.exec(k || ''); return m ? { mathArena: 'Math Arena', langQuest: 'Language Quest', codeQuest: 'Code Quest', musicQuest: 'Music Quest' }[m[1]] : 'Family'; }
+  function kb(n) { return Math.round((n || 0) / 1024) + ' KB'; }
+  function healthMap() {
+    var it = FS.mirror().items[K.health || 'familyApps.syncHealth.v1'], v = it && it.value, m = {};
+    if (v && v.v === 2 && v.devices) { for (var k in v.devices) m[k] = v.devices[k]; } else if (v && v.device) m[v.device] = v;
+    return m;
+  }
+  function healthOf(id) { return healthMap()[id] || null; }
+  function tooBigText(hl) { return (hl.tooBig || []).map(function (t) { return appOfKey(t.key) + ' (' + kb(t.size) + ')'; }).join(', '); }
+  function staleMs(d) { var t = Date.parse(d && d.lastSeen || ''); return isFinite(t) ? Date.now() - t : 0; }
+  function alerts() {
+    var out = [], kids = kidDevices(), k = newest(kids);
+    if (k && staleMs(k) > DAY) out.push(h('div.alert', { role: 'status', 'data-alert': 'stale' }, h('b', { text: (kids.length > 1 ? 'None of his laptops has synced for ' : 'His laptop last synced ') + ago(k.lastSeen).replace(' ago', '') + (kids.length > 1 ? '. ' : ' ago. ') }), 'What you see may be out of date. It catches up the next time he opens any app online.'));
+    kids.forEach(function (d) {
+      var hl = healthOf(d.id);
+      if (hl && hl.state === 'paused' && hl.paused === 'too-big') out.push(h('div.alert', { role: 'status', 'data-alert': 'too-big' }, h('b', { text: 'Sync paused on ' + labelOf(d) + ': too big. ' }), 'Some of his progress is over the 300 KB backup limit: ' + tooBigText(hl) + '. It stays safe on that laptop, but is not backed up. Tell the app builder.'));
+    });
+    return out;
   }
   function done() { var it = FS.mirror().items[K.requestsDone]; return (it && it.value && it.value.done) || {}; }
   function ticketsCard() {
@@ -381,7 +418,27 @@
       reqs.length ? h('p.small', null, 'Requests: ', reqs.slice(0, 5).map(function (r) { return h('span.pill' + (d[r.id] ? '' : '.wait'), { text: (r.amount > 0 ? '+' : '') + r.amount + ' ' + (r.app === 'rupees' ? 'rupees' : r.app) + (d[r.id] ? ' ✔' : ' · waiting') }); })) : null);
     var tbl = h('table.ledger', null, h('thead', null, h('tr', null, ['When', 'App', 'What', 'Amount'].map(function (x) { return h('th', { text: x }); }))));
     var tb = h('tbody');
-    ev.forEach(function (e) {
+    var dl = withMirror(function () { return FW.daily ? FW.daily() : {}; }) || {}, rows = ev.map(function (e) { return { at: Date.parse(e.at) || 0, e: e }; });
+    var oldest = rows.length ? rows[rows.length - 1].at : 0;
+    Object.keys(dl).forEach(function (day) {
+      var parts = [], end = new Date(day + 'T23:59:59').getTime();
+      if (rows.length >= 50 && end < oldest) return;
+      APPS.forEach(function (a) {
+        var x = dl[day][a.id];
+        if (!x) return;
+        var bits = [];
+        if (x.repeat) bits.push(x.repeat + (x.repeat === 1 ? ' repeat' : ' repeats') + ' \u2014 no reward');
+        if (x.repeatRupees) bits.push(x.repeatRupees + (x.repeatRupees === 1 ? ' repeated answer' : ' repeated answers') + ' \u2014 no rupees');
+        if (x.banked) bits.push(x.banked + ' shards banked');
+        if (x.released) bits.push(x.released + ' banked shards paid');
+        if (bits.length) parts.push(a.name + ': ' + bits.join(', '));
+      });
+      if (parts.length) rows.push({ at: Math.min(end, Date.now()), sum: new Date(day + 'T12:00:00').toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' \u00b7 ' + parts.join(' \u00b7 ') });
+    });
+    rows.sort(function (p, q) { return q.at - p.at; });
+    rows.forEach(function (r) {
+      if (r.sum) { tb.appendChild(h('tr.sumrow', null, h('td', { colSpan: 4, text: r.sum }))); return; }
+      var e = r.e;
       var a = APPS.filter(function (x) { return x.id === e.app; })[0];
       tb.appendChild(h('tr', { style: a ? '--rowc:' + a.color : null }, h('td', { text: when(e.at) }), h('td', { text: a ? a.name : e.app === 'family' ? 'All' : e.app }), h('td', { text: (e.kind === 'adjust' || e.tag === 'parent' ? 'Grown-up: ' : '') + (e.reason || e.kind) }), h('td.amt' + (e.amount < 0 ? '.neg' : ''), null, (e.amount > 0 ? '+' : '') + e.amount, e.kind === 'rupee' || e.kind === 'buy' ? h('img.ramt', { src: img('rupee_green'), alt: 'rupees', width: 14, height: 14 }) : null)));
     });
@@ -397,11 +454,28 @@
     return h('div.card', { id: 'updatecodes' }, h('h3', { text: 'Update setup codes' }), h('p.small', { text: 'Paste new codes, or open an import link (…/family/#import=…) on this laptop.' }), ta,
       h('button.btn', { text: 'Import', on: { click: function () { importCodes(ta.value); route(); } } }), msgFor('codes'));
   }
+  function saveDevMeta(fn) { var m = devMeta(); fn(m); m.v = 1; m.updatedAt = new Date().toISOString(); FS.setSetting(K.devices || 'familyApps.devices.v1', m); }
   function devicesCard() {
-    var list = (FS.mirror().devices || []).filter(function (d) { return !/^check-deploy/.test(d.id); });
-    var me = (FS.config() || {}).deviceId;
-    return h('div.card', { id: 'devices' }, h('h3', { text: 'Devices' }),
-      list.length ? h('ul.devices', null, list.map(function (d) { return h('li', null, h('b', { text: d.role === 'kid' ? 'His laptop' : d.id === me ? 'This laptop (you)' : 'Grown-up device' }), h('span', { text: ' · ' + (d.name || 'device') + (d.role === 'kid' && !d.kidWriter ? ' · replaced' : '') }), h('small', { text: 'seen ' + ago(d.lastSeen) })); })) : h('p.muted', { text: 'No devices yet.' }));
+    var meta = devMeta(), kids = kidDevices(), me = (FS.config() || {}).deviceId;
+    var grown = (FS.mirror().devices || []).filter(function (d) { return d.role !== 'kid' && !/^check-deploy/.test(d.id); });
+    var hidden = allKids().filter(function (d) { return removedNow(d, meta); }).length;
+    return h('div.card', { id: 'devices' }, h('h3', { text: 'His laptops' }),
+      kids.length ? h('ul.devices.kids', null, kids.map(function (d) {
+        var stale = staleMs(d) > DAY, hl = healthOf(d.id), big = hl && hl.state === 'paused' && hl.paused === 'too-big';
+        var name = h('input.inp.devname', { value: ui.devDraft && ui.devDraft[d.id] != null ? ui.devDraft[d.id] : labelOf(d), maxLength: 30, 'aria-label': 'Name for this laptop', on: { input: function (e) { ui.devDraft = ui.devDraft || {}; ui.devDraft[d.id] = e.target.value; } } });
+        return h('li' + (stale ? '.stale' : ''), { 'data-device': d.id },
+          h('div.devrow', null, name,
+            h('button.btn.small', { text: 'Rename', on: { click: function () { var v = (name.value || '').trim().slice(0, 30); saveDevMeta(function (m) { if (v) m.names[d.id] = v; else delete m.names[d.id]; }); if (ui.devDraft) delete ui.devDraft[d.id]; say('devices', 'Saved.'); route(); } } }),
+            h('button.btn.small.link.danger', { text: 'Remove', on: { click: function () { if (!confirm('Remove "' + labelOf(d) + '" from this list? If he uses it again it comes back by itself. (The family link stays the same.)')) return; saveDevMeta(function (m) { m.removed[d.id] = new Date().toISOString(); }); say('devices', labelOf(d) + ' removed from the list.'); route(); } } })),
+          h('small', { text: (d.name || 'laptop') + ' · ' + (stale ? '⚠ ' : '') + 'last seen ' + ago(d.lastSeen) + ' · last sync from it ' + (d.lastPush ? ago(d.lastPush) : '—') + (d.version ? ' · v' + String(d.version).split('/')[0] : '') }),
+          big ? h('span.flag', { text: '⚠ sync paused: too big · ' + tooBigText(hl) }) : null);
+      })) : h('p.muted', { text: 'No laptop connected yet (step 6).' }),
+      hidden ? h('p.small.muted', { text: hidden + ' removed ' + (hidden === 1 ? 'laptop is' : 'laptops are') + ' hidden.' }) : null,
+      msgFor('devices'),
+      grown.length ? h('h4.lh', { text: 'Grown-up devices' }) : null,
+      grown.length ? h('ul.devices', null, grown.map(function (d) {
+        return h('li', { 'data-device': d.id }, h('b', { text: d.id === me ? 'This laptop (you)' : 'Grown-up device' }), h('span', { text: ' · ' + (d.name || 'device') }), h('small', { text: 'last seen ' + ago(d.lastSeen) }));
+      })) : null);
   }
   function footer() {
     var s = FS.status();
@@ -433,9 +507,9 @@
     main.appendChild(h('details.card.small', null, h('summary', { text: 'Not his laptop?' }), h('button.btn.link.danger', { text: 'Disconnect this browser', on: { click: function () { if (confirm('Disconnect this browser from the family? Progress stays on this laptop.')) { FS.disconnect(); route(); } } } })));
   }
   function renderJoin(force) {
-    var main = shell('Connecting his laptop', 'One time only · about 30 seconds', true);
+    var main = shell('Connecting this laptop', 'One time per laptop · about 30 seconds', true);
     var j = stash.join;
-    if (!j) { main.appendChild(h('div.card.bad', null, h('h2', { text: 'This link is not complete' }), h('p', { text: 'Copy the whole link from the Family Hub (Connect his laptop › Copy link) and open it again.' }))); return; }
+    if (!j) { main.appendChild(h('div.card.bad', null, h('h2', { text: 'This link is not complete' }), h('p', { text: 'Copy the whole link from the Family Hub (Connect each laptop › Copy link) and open it again.' }))); return; }
     if (FS.role() === 'grownup' && !force) {
       main.appendChild(h('div.card.warn', null, h('h2', { text: 'This is your grown-up laptop' }), h('p', { text: 'Open this link on his laptop instead. Using it here would turn this browser into his device.' }),
         h('div.row', null, h('a.btn.primary', { href: HUB_URL, text: 'Open the Family Hub', on: { click: function (e) { e.preventDefault(); stash.join = null; route(); } } }),

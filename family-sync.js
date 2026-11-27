@@ -1,5 +1,5 @@
 /*!
- * family-sync.js 1.0.0 - Family Sync for Math Arena, Language Quest, Code Quest, Music Quest and the Family Hub.
+ * family-sync.js 1.1.0 - Family Sync for Math Arena, Language Quest, Code Quest, Music Quest and the Family Hub.
  * Copy this file UNCHANGED into every app (same origin, same localStorage), like family-wallet.js. Vanilla JS, no deps.
  *
  * WHAT IT DOES
@@ -8,7 +8,11 @@
  *   Script web app bound to a Sheet in the grown-up's account). Every key has ONE writer:
  *     settings keys: written only by grown-up devices;  progress keys: written only by the kid device.
  *   Parent actions on kid-owned data (shard/rupee adjustments, ticket approvals) are REQUESTS that the kid device
- *   applies once, idempotent by id, through FamilyWallet. Nothing can conflict.
+ *   applies once, idempotent by id, through FamilyWallet.
+ * 1.1: HE MAY USE SEVERAL LAPTOPS. Every connected kid laptop owns the kid keys. Each key remembers the cloud rev it is
+ *   based on (baseRev); a newer cloud value is taken when this laptop did not change the key, and merged when both did:
+ *   wallet = union of ledger events, tickets/inventory/requests = union, minutes = 3-way per day and app, an app's own
+ *   progress = the higher score (the other copy is kept 30 days in familyApps.backup.<app>.v1 and listed in FS.log()).
  *
  * NOT CONNECTED = TODAY'S BEHAVIOUR: no network, no localStorage writes, status().state === 'off'.
  *
@@ -18,6 +22,9 @@
  *   familyApps.sync.mirror.v1 grown-up only: latest copy of the kid's family progress (Hub dashboard, offline first)
  *   familyApps.sync.backup.v1 kid only: the side that lost a first-connect merge
  *   familyApps.sync.lease.v1  tab lease when navigator.locks is missing
+ *   familyApps.syncHealth.v1  kid laptops -> Hub (synced like progress): {v:2, devices:{id:{state, paused:''|'too-big', tooBig:[{key,size}], at}}}
+ *   familyApps.backup.<app>.v1 kid laptops: the losing copy of an app's progress after a two-laptop conflict (30 days)
+ *   familyApps.devices.v1     grown-up: names for his laptops and the ones removed from the Hub list
  *
  * PROTOCOL v1  POST text/plain (no CORS preflight) JSON {v:1, op, familyId, auth, device, ...} -> JSON {ok, ...}
  *   create {}                         first time only          ping {}  -> {ok, family}
@@ -34,7 +41,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this, function (root) {
   'use strict';
   function make() {
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
     var K = {
       config: 'familyApps.sync.v1', state: 'familyApps.sync.state.v1', mirror: 'familyApps.sync.mirror.v1',
       backup: 'familyApps.sync.backup.v1', lease: 'familyApps.sync.lease.v1',
@@ -42,6 +49,7 @@
       walletAdjust: 'familyApps.walletAdjust.v1', ticketApprovals: 'familyApps.ticketApprovals.v1', look: 'familyApps.look.v1',
       wallet: 'familyApps.wallet.v1', walletTime: 'familyApps.walletTime.v1', tickets: 'familyApps.tickets.v1',
       inventory: 'familyApps.inventory.v1', requestsDone: 'familyApps.requestsDone.v1', skin: 'hyruleKit.skin',
+      health: 'familyApps.syncHealth.v1', devices: 'familyApps.devices.v1',
     };
     var APPS = ['math', 'language', 'code', 'music'];
     var LOOKS = { hyrule: 1, grove: 1 };
@@ -161,12 +169,14 @@
       each(spec.localOnly, function (x) { x = norm(x); if (x && !isFamilyKey(x.key)) rule(x.key, 'local', app, x); });
       if (typeof spec.score === 'function') group(app).score = spec.score;
       if (!REG[summaryKey(app)]) rule(summaryKey(app), 'kid', 'family:summary');
+      if (!REG['familyApps.backup.' + app + '.v1']) rule('familyApps.backup.' + app + '.v1', 'kid', 'family:backup');
       if (!thisApp && spec.current !== false) thisApp = app;
       return true;
     }
-    [K.rewards, K.pin, K.walletAdjust, K.ticketApprovals, K.look].forEach(function (k) { rule(k, 'grownup', 'family'); });
+    [K.rewards, K.pin, K.walletAdjust, K.ticketApprovals, K.look, K.devices].forEach(function (k) { rule(k, 'grownup', 'family'); });
     rule(K.aiKey, 'grownup', 'family', { codec: 'aes' });
     [K.wallet, K.walletTime, K.tickets, K.inventory, K.requestsDone].forEach(function (k) { rule(k, 'kid', 'family'); });
+    rule(K.health, 'kid', 'family:health');
     APPS.forEach(function (a) { rule(summaryKey(a), 'kid', 'family:summary'); });
     // The four apps' own keys (same lists as INTEGRATION.md); an app's register() call can extend them.
     var BUILTIN = {
@@ -197,8 +207,10 @@
     function saveConfig() { if (cfg) writeJSON(K.config, cfg); }
     function isConnected() { return !!loadConfig(); }
     function role() { return loadConfig() ? cfg.role : null; }
-    function freshState() { return { v: 1, pushed: {}, applied: {}, pending: {}, failCount: 0, nextRetryAt: 0, lastPullAt: 0, lastOkAt: 0, lastError: '', keysSig: '', paused: '', tooBig: {} }; }
-    function loadState() { var s = readJSON(K.state); st = s && s.v === 1 ? s : freshState(); ['pushed', 'applied', 'pending', 'tooBig'].forEach(function (n) { if (!st[n] || typeof st[n] !== 'object') st[n] = {}; }); return st; }
+    function freshState() { return { v: 1, pushed: {}, applied: {}, pending: {}, base: {}, baseVals: {}, failCount: 0, nextRetryAt: 0, lastPullAt: 0, lastOkAt: 0, lastError: '', keysSig: '', paused: '', tooBig: {}, healthSig: '', fresh: null, log: [] }; }
+    function loadState() { var s = readJSON(K.state); st = s && s.v === 1 ? s : freshState(); ['pushed', 'applied', 'pending', 'tooBig', 'base', 'baseVals'].forEach(function (n) { if (!st[n] || typeof st[n] !== 'object') st[n] = {}; }); if (!Array.isArray(st.log)) st.log = [];
+      if (st.paused === 'not-writer') { st.paused = ''; st.lastError = ''; } // 1.0.x "replaced" laptops resume by themselves
+      return st; }
     function saveState() { if (st && cfg) writeJSON(K.state, st); }
     function loadMirror() { var m = readJSON(K.mirror); return m && m.v === 1 ? m : { v: 1, items: {}, devices: [], at: '' }; }
 
@@ -261,10 +273,12 @@
     function computeStatus(state) {
       if (!loadConfig()) return { connected: false, role: null, state: 'off', text: '', pending: 0 };
       if (!st) loadState();
-      var pending = keysOf(st.pending).length, s = state || cur.state;
-      if (st.paused) s = 'paused';
-      var text = { synced: '☁ synced', pending: '☁ saving…', syncing: '☁ syncing…', offline: '☁ offline · saved here', error: '☁ sync problem', paused: '☁ sync paused', idle: '☁ connected' }[s] || '☁ connected';
-      return { connected: true, role: cfg.role, state: s, text: text, pending: pending, lastSyncAt: st.lastOkAt ? iso(st.lastOkAt) : '', lastError: st.lastError || '', paused: st.paused || '', deviceId: cfg.deviceId, familyId: cfg.familyId.slice(0, 6) + '…', tooBig: keysOf(st.tooBig) };
+      var pending = keysOf(st.pending).length, s = state || cur.state, big = keysOf(st.tooBig);
+      // paused: a key is over the size cap and cannot be backed up (too-big)
+      var why = st.paused || (big.length ? 'too-big' : '');
+      if (st.paused || (big.length && (s === 'synced' || s === 'pending' || s === 'idle'))) s = 'paused';
+      var text = { synced: '☁ synced', pending: '☁ saving…', syncing: '☁ syncing…', offline: '☁ offline · saved here', error: '☁ sync problem', paused: why === 'too-big' ? '☁ sync paused · too big' : '☁ sync paused', idle: '☁ connected' }[s] || '☁ connected';
+      return { connected: true, role: cfg.role, state: s, text: text, pending: pending, lastSyncAt: st.lastOkAt ? iso(st.lastOkAt) : '', lastError: st.lastError || '', paused: why, deviceId: cfg.deviceId, familyId: cfg.familyId.slice(0, 6) + '…', tooBig: big };
     }
     function setStatus(state) {
       var prev = cur.state;
@@ -357,8 +371,18 @@
         try { var parsed = {}; for (var k in vals) parsed[k] = parse(vals[k]); var n = Number(g.score(parsed, vals)); if (isFinite(n)) return n; } catch (e) {}
       }
       if (grp === 'family') return familyScore(vals);
-      var len = 0; for (var k2 in vals) len += String(vals[k2]).length;
-      return len;
+      // default: how much progress the data holds = items in lists + keys + small counters (timestamps ignored);
+      // the text length only breaks ties. Apps should register their own score (INTEGRATION-1.1.md).
+      var n = 0, len = 0;
+      function walk(x, depth) {
+        if (depth > 12 || x == null) return;
+        if (typeof x === 'number') { if (isFinite(x) && x > 0 && x <= 100000) n += x; return; }
+        if (typeof x === 'boolean') { if (x) n += 1; return; }
+        if (Array.isArray(x)) { n += x.length; for (var i = 0; i < x.length && i < 5000; i++) walk(x[i], depth + 1); return; }
+        if (typeof x === 'object') for (var k in x) { n += 1; walk(x[k], depth + 1); }
+      }
+      for (var k2 in vals) { len += String(vals[k2]).length; walk(parse(vals[k2]), 0); }
+      return n + len / 1e7;
     }
     /** Decide a first-connect merge for one group. Pure: returns {use:'local'|'cloud'|'same'|'none', ...}. */
     function decideMerge(grp, keys, local, cloud) {
@@ -378,17 +402,407 @@
       var mine = keysOwnedBy(cfg.role === 'kid' ? 'kid' : 'grownup'), n = 0;
       for (var i = 0; i < mine.length; i++) {
         var k = mine[i], v = getRaw(k), h = hashStr(v);
+        if (st.tooBig[k] && st.tooBig[k] !== h) delete st.tooBig[k]; // the too-big value was replaced (even by the last pushed one)
         if (st.pushed[k] === undefined && v == null) continue;
-        if (st.pushed[k] !== h) { if (!st.pending[k]) { st.pending[k] = now(); n++; } if (st.tooBig[k] && st.tooBig[k] !== h) delete st.tooBig[k]; }
+        if (st.pushed[k] !== h) { if (!st.pending[k]) { st.pending[k] = now(); n++; } }
         else if (st.pending[k]) delete st.pending[k];
       }
       return n;
+    }
+    // ---------- 1.1: several kid laptops — merges for keys two laptops changed ----------
+    var MAXEV = 1000, BACKUP_DAYS = 30, BACKUP_MAX = 280000;
+    function tms(x) { return typeof x === 'number' ? x : Date.parse(x || '') || 0; }
+    function localDay(t) { var d = new Date(t); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+    function earnedSum(w) { var n = 0; if (w && w.totals) for (var a in w.totals) if (w.totals[a] && typeof w.totals[a].earned === 'number') n += w.totals[a].earned; return n; }
+    /** familyApps.wallet.v1: union of ledger events by id. Start from the side with more earned and add the other side's
+     *  missing events to its totals (FamilyWallet's rules: daily caps, once-a-day bonuses, one event per parent request). */
+    function mergeWallet(Ls, Cs) {
+      var a = parse(Ls), b = parse(Cs);
+      if (!a || !Array.isArray(a.events)) return Cs;
+      if (!b || !Array.isArray(b.events)) return Ls;
+      var X = earnedSum(a) >= earnedSum(b) ? a : b, Y = X === a ? b : a;
+      X.totals = X.totals || {};
+      var s = X.settings || {}, capTime = s.dailyTimeCap != null ? s.dailyTimeCap : 6, capCb = s.comebackDailyCap != null ? s.comebackDailyCap : 3;
+      var capOnce = s.onceDailyCap != null ? s.onceDailyCap : 6;
+      var ids = {}, counts = {}, oldest = Infinity, more = false;
+      var hadBank = (Array.isArray(a.bank) && a.bank.length) || (Array.isArray(b.bank) && b.bank.length);
+      X.bank = Array.isArray(X.bank) ? X.bank : [];
+      function ckey(e) {
+        var day = localDay(tms(e.at));
+        if (e.tag === 'parent' && e.ref) return 'pr|' + e.ref;
+        if (e.tag === 'triforceDay') return 'tf|' + day;
+        if (e.tag === 'streak') return 'st|' + e.app + '|' + day;
+        if (e.tag === 'migrate') return 'mg|' + e.app + '|' + e.kind;
+        if (e.tag === 'time') return 'ti|' + e.app + '|' + day;
+        if (e.tag === 'comeback') return 'cb|' + e.app + '|' + day;
+        if (e.tag === 'once' || e.tag === 'onceBank') return 'on|' + e.app + '|' + day;
+        return null;
+      }
+      var SUMS = { time: 1, comeback: 1, once: 1, onceBank: 1 };
+      function count(e) {
+        var k = ckey(e), amt = Math.max(0, Math.round(Number(e.amount) || 0));
+        if (k) counts[k] = (counts[k] || 0) + (SUMS[e.tag] ? amt : 1);
+        if (e.tag === 'onceBank' && e.ref) counts['ob|' + e.ref] = (counts['ob|' + e.ref] || 0) + amt;
+      }
+      each(X.events, function (e) { if (!e) return; if (e.id) ids[e.id] = 1; count(e); var t = tms(e.at); if (t < oldest) oldest = t; });
+      var trimmed = X.events.length >= MAXEV, added = 0;
+      Y.events.filter(function (e) { return e && e.id && !ids[e.id]; }).sort(function (p, q) { return tms(p.at) - tms(q.at); }).forEach(function (e) {
+        if (trimmed && tms(e.at) < oldest) return; // may already be inside X's totals (X dropped it as old)
+        var k = ckey(e), amt = Math.round(Number(e.amount) || 0), have = k ? counts[k] || 0 : 0;
+        if (k && (e.tag === 'parent' || e.tag === 'triforceDay' || e.tag === 'streak' || e.tag === 'migrate') && have >= 1) return;
+        if (k && (e.tag === 'time' || e.tag === 'comeback') && amt > 0) { amt = Math.min(amt, Math.max(0, (e.tag === 'time' ? capTime : capCb) - have)); if (amt <= 0) return; }
+        if (e.tag === 'onceBank' && e.ref && e.total != null) { amt = Math.min(amt, Math.max(0, e.total - (counts['ob|' + e.ref] || 0))); if (amt <= 0) return; }
+        if ((e.tag === 'once' || e.tag === 'onceBank') && amt > 0) {
+          // 1.2: the daily cap on new-learning shards holds across laptops; the excess is banked for later days
+          var paidNow = Math.min(amt, Math.max(0, capOnce - have)), extra = amt - paidNow;
+          if (extra > 0) X.bank.push({ bid: e.id + ':m', app: e.app, onceId: e.ref, want: e.want, total: extra, released: 0, label: String(e.reason || 'Lesson').slice(0, 80), at: e.at });
+          amt = paidNow;
+          if (amt <= 0) { more = true; return; }
+        }
+        var ev = {};
+        for (var f in e) ev[f] = e[f];
+        ev.amount = amt;
+        var bucket = ev.kind === 'rupee' || ev.kind === 'buy' ? 'rupees' : ev.app;
+        if (bucket === 'rupees' || APPS.indexOf(bucket) >= 0 || X.totals[bucket]) {
+          var tt = X.totals[bucket] || (X.totals[bucket] = { earned: 0, spent: 0 });
+          if (amt >= 0) tt.earned += amt; else tt.spent += -amt;
+        }
+        X.events.push(ev); ids[ev.id] = 1; count(ev); added++;
+      });
+      // growing ledger lines (correct answers, new correct answers): the bigger amount wins
+      var yById = {};
+      each(Y.events, function (e) { if (e && e.id) yById[e.id] = e; });
+      each(X.events, function (e) {
+        if (!e || !e.id || (e.tag !== 'correct' && e.tag !== 'rupeeOnce')) return;
+        var o = yById[e.id], dlt = o ? Math.round(Number(o.amount) || 0) - Math.round(Number(e.amount) || 0) : 0;
+        if (dlt > 0) { e.amount += dlt; if (tms(o.at) > tms(e.at)) e.at = o.at; var tr = X.totals.rupees || (X.totals.rupees = { earned: 0, spent: 0 }); tr.earned += dlt; added++; }
+      });
+      X.events.sort(function (p, q) { return tms(p.at) - tms(q.at); });
+      if (X.events.length > MAXEV) X.events = X.events.slice(X.events.length - MAXEV);
+      // 1.2 fields: once (union, earliest day), seenRupee (union, latest day, 5,000 per app), daily (max), bank (union)
+      if (Y.once && typeof Y.once === 'object') {
+        X.once = X.once && typeof X.once === 'object' ? X.once : {};
+        for (var oa in Y.once) { var xo = X.once[oa] || (X.once[oa] = {}), yo = Y.once[oa] || {}; for (var oi in yo) if (xo[oi] == null || yo[oi] < xo[oi]) { xo[oi] = yo[oi]; more = true; } }
+      }
+      if (Y.seenRupee && typeof Y.seenRupee === 'object') {
+        X.seenRupee = X.seenRupee && typeof X.seenRupee === 'object' ? X.seenRupee : {};
+        for (var sa in Y.seenRupee) {
+          var xs = X.seenRupee[sa] || (X.seenRupee[sa] = {}), ys = Y.seenRupee[sa] || {};
+          for (var si in ys) if (xs[si] == null || ys[si] > xs[si]) { xs[si] = ys[si]; more = true; }
+          var sk = keysOf(xs);
+          if (sk.length > 5000) { sk.sort(function (p, q) { return xs[p] - xs[q]; }); for (var z = 0; z < sk.length - 5000; z++) delete xs[sk[z]]; }
+        }
+      }
+      if (Y.daily && typeof Y.daily === 'object') {
+        X.daily = X.daily && typeof X.daily === 'object' ? X.daily : {};
+        for (var dd in Y.daily) for (var da in Y.daily[dd] || {}) for (var df in Y.daily[dd][da] || {}) {
+          var xd = (X.daily[dd] = X.daily[dd] || {}), xa = (xd[da] = xd[da] || {}), yv = Number(Y.daily[dd][da][df]) || 0;
+          if (yv > (xa[df] || 0)) { xa[df] = yv; more = true; }
+        }
+      }
+      var bankBy = {}, relSum = {}, paidOnce = {};
+      each(X.bank, function (bk) { if (bk && bk.bid) bankBy[bk.bid] = bk; });
+      each(Y.bank, function (bk) {
+        if (!bk || !bk.bid) return;
+        var o = bankBy[bk.bid];
+        if (!o) { var c = {}; for (var f2 in bk) c[f2] = bk[f2]; bankBy[bk.bid] = c; more = true; }
+        else { if ((bk.total || 0) > (o.total || 0)) { o.total = bk.total; more = true; } if ((bk.released || 0) > (o.released || 0)) { o.released = bk.released; more = true; } }
+      });
+      each(X.events, function (e) {
+        if (!e) return;
+        if (e.tag === 'onceBank' && e.ref) relSum[e.ref] = (relSum[e.ref] || 0) + (e.amount || 0);
+        if (e.tag === 'once') paidOnce[e.app + '|' + e.ref] = (paidOnce[e.app + '|' + e.ref] || 0) + (e.amount || 0);
+      });
+      // per onceId: paid + banked never exceeds what that pass was worth (want); entries made on a laptop come first
+      var usedOnce = {};
+      X.bank = keysOf(bankBy).map(function (k) { return bankBy[k]; }).sort(function (p, q) {
+        return (/:bank$/.test(q.bid) ? 1 : 0) - (/:bank$/.test(p.bid) ? 1 : 0) || tms(p.at) - tms(q.at);
+      }).map(function (bk) {
+        bk.released = Math.max(bk.released || 0, relSum[bk.bid] || 0);
+        if (bk.want != null && bk.onceId != null) {
+          var key = bk.app + '|' + bk.onceId, used = usedOnce[key] != null ? usedOnce[key] : paidOnce[key] || 0;
+          var allowed = Math.max(0, bk.want - used);
+          if ((bk.total || 0) > allowed) { bk.total = Math.max(bk.released || 0, allowed); more = true; }
+          usedOnce[key] = used + (bk.total || 0);
+        }
+        return bk;
+      }).filter(function (bk) { return (bk.total || 0) - (bk.released || 0) > 0; });
+      if (!X.bank.length && !hadBank) delete X.bank;
+      if (Y.migrated && typeof Y.migrated === 'object') {
+        X.migrated = X.migrated || {};
+        for (var app in Y.migrated) { var ym = Y.migrated[app] || {}, xm = X.migrated[app] || (X.migrated[app] = {}); for (var part in ym) if (ym[part] && !xm[part]) { xm[part] = ym[part]; more = true; } }
+      }
+      if (Y.settings && tms(Y.updatedAt) > tms(X.updatedAt) && JSON.stringify(Y.settings) !== JSON.stringify(X.settings)) { X.settings = Y.settings; more = true; }
+      if (!added && !more) return X === a ? Ls : Cs; // nothing new from the other side
+      X.updatedAt = iso(Math.max(tms(X.updatedAt), tms(Y.updatedAt)) || now());
+      return JSON.stringify(X);
+    }
+    /** familyApps.tickets.v1: union by id; "used" wins. */
+    function mergeTickets(Ls, Cs) {
+      var a = parse(Ls), b = parse(Cs);
+      if (!Array.isArray(a)) return Cs;
+      if (!Array.isArray(b)) return Ls;
+      var by = {};
+      a.concat(b).forEach(function (t) { if (!t || !t.id) return; var o = by[t.id]; if (!o || (t.status === 'used' && o.status !== 'used')) by[t.id] = t; });
+      return JSON.stringify(keysOf(by).map(function (k) { return by[k]; }).sort(function (p, q) { return tms(q.earnedAt) - tms(p.earnedAt); }).slice(0, 200));
+    }
+    /** familyApps.inventory.v1: owned = union; what is equipped and the goal come from the newer side. */
+    function mergeInventory(Ls, Cs) {
+      var a = parse(Ls), b = parse(Cs);
+      if (!a || typeof a !== 'object') return Cs;
+      if (!b || typeof b !== 'object') return Ls;
+      var newer = tms(b.updatedAt) > tms(a.updatedAt) ? b : a, out = {};
+      for (var k in newer) out[k] = newer[k];
+      var owned = (Array.isArray(a.owned) ? a.owned : []).concat(Array.isArray(b.owned) ? b.owned : []);
+      out.owned = owned.filter(function (x, i) { return owned.indexOf(x) === i; });
+      out.updatedAt = iso(Math.max(tms(a.updatedAt), tms(b.updatedAt)) || now());
+      return JSON.stringify(out);
+    }
+    /** familyApps.walletTime.v1: per (day, app) local + cloud - common base (3-way, so nothing is counted twice).
+     *  Bs null = no shared history (a new laptop): the minutes add up. Bs unknown (undefined): the larger one is kept. */
+    function mergeTime(Ls, Cs, Bs) {
+      var a = parse(Ls), c = parse(Cs), b = Bs === undefined ? undefined : parse(Bs);
+      if (!a || !a.days) return Cs;
+      if (!c || !c.days) return Ls;
+      var bd = b && b.days ? b.days : {}, out = {}, days = {};
+      for (var f in a) if (f !== 'days') out[f] = a[f];
+      out.days = {};
+      for (var d in a.days) days[d] = 1;
+      for (var d2 in c.days) days[d2] = 1;
+      keysOf(days).forEach(function (d) {
+        var A = a.days[d] || {}, C = c.days[d] || {}, B = bd[d] || {}, o = {}, apps = {};
+        [A, C].forEach(function (x) { for (var k in x) if (k !== 'done' && typeof x[k] === 'number') apps[k] = 1; });
+        var three = function (Av, Cv, Bv) { var av = Number(Av) || 0, cv = Number(Cv) || 0; if (b === undefined) return Math.max(av, cv); var bv = Math.min(Number(Bv) || 0, av, cv); return av + cv - bv; };
+        for (var app in apps) o[app] = three(A[app], C[app], B[app]);
+        if (A.rep || C.rep) { // 1.2: review minutes (no shards), same rule
+          var AR = A.rep || {}, CR = C.rep || {}, BR = B.rep || {}, rk = {};
+          for (var r1 in AR) rk[r1] = 1;
+          for (var r2 in CR) rk[r2] = 1;
+          o.rep = {};
+          for (var ra in rk) o.rep[ra] = three(AR[ra], CR[ra], BR[ra]);
+        }
+        if (A.done || C.done) { o.done = {}; [A.done, C.done].forEach(function (x) { for (var k in x || {}) o.done[k] = x[k]; }); }
+        out.days[d] = o;
+      });
+      var ks = keysOf(out.days).sort();
+      while (ks.length > 70) delete out.days[ks.shift()];
+      return JSON.stringify(out);
+    }
+    /** familyApps.requestsDone.v1: union; an entry that worked wins. */
+    function mergeDone(Ls, Cs) {
+      var a = parse(Ls), b = parse(Cs);
+      if (!a || !a.done) return Cs;
+      if (!b || !b.done) return Ls;
+      var out = { v: 1, done: {}, updatedAt: iso(Math.max(tms(a.updatedAt), tms(b.updatedAt)) || now()) };
+      for (var k in a.done) out.done[k] = a.done[k];
+      for (var k2 in b.done) if (!out.done[k2] || (b.done[k2] && b.done[k2].ok && !out.done[k2].ok)) out.done[k2] = b.done[k2];
+      return JSON.stringify(out);
+    }
+    function healthMap(o) {
+      var m = {};
+      if (!o || typeof o !== 'object') return m;
+      if (o.v === 2 && o.devices && typeof o.devices === 'object') { for (var k in o.devices) m[k] = o.devices[k]; return m; }
+      if (o.device) m[o.device] = o; // 1.0.1 shape: one device
+      return m;
+    }
+    /** familyApps.syncHealth.v1 (v2): one entry per laptop; the newer entry for a laptop wins. */
+    function mergeHealth(Ls, Cs) {
+      var a = healthMap(parse(Ls)), b = healthMap(parse(Cs));
+      for (var id in b) if (!a[id] || tms(b[id].at) > tms(a[id].at)) a[id] = b[id];
+      return JSON.stringify({ v: 2, devices: a });
+    }
+    function backupKey(grp) { return 'familyApps.backup.' + grp + '.v1'; }
+    function backupJSON(entries) {
+      var cutoff = now() - BACKUP_DAYS * 86400000, out = { v: 1, entries: [] }, size = 40;
+      entries.filter(function (e) { return e && tms(e.at) >= cutoff; }).sort(function (p, q) { return tms(q.at) - tms(p.at); }).forEach(function (e) {
+        var len = JSON.stringify(e).length + 1;
+        if (size + len <= BACKUP_MAX) { out.entries.push(e); size += len; }
+      });
+      return JSON.stringify(out);
+    }
+    /** familyApps.backup.<app>.v1: union of entries by id, newest first, 30 days, under the size cap. */
+    function mergeBackup(Ls, Cs) {
+      var by = {};
+      [parse(Ls), parse(Cs)].forEach(function (o) { each(o && o.entries, function (e) { if (e && e.id) by[e.id] = e; }); });
+      return backupJSON(keysOf(by).map(function (k) { return by[k]; }));
+    }
+    function mergerFor(k) {
+      if (k === K.wallet) return mergeWallet;
+      if (k === K.tickets) return mergeTickets;
+      if (k === K.inventory) return mergeInventory;
+      if (k === K.walletTime) return mergeTime;
+      if (k === K.requestsDone) return mergeDone;
+      if (k === K.health) return mergeHealth;
+      if (REG[k] && REG[k].group === 'family:backup') return mergeBackup;
+      return null;
+    }
+    function setBase(k, v, rev) { st.pushed[k] = hashStr(v); st.base[k] = Number(rev) || 0; if (k === K.walletTime) st.baseVals[k] = v == null ? null : v; }
+    function adopt(k, v, rev) { setRaw(k, v); setBase(k, v, rev); delete st.pending[k]; }
+    function addTo(list, x) { if (list && list.indexOf(x) < 0) list.push(x); }
+    /** Keep the losing copy of an app's progress: on this laptop (last 5) and in the family backup key (30 days). */
+    function backupLoser(grp, vals, reason, side) {
+      var items = {}, size = 0;
+      for (var k in vals) if (vals[k] != null) { items[k] = vals[k]; size += String(vals[k]).length; }
+      if (!size || !cfg) return false;
+      var entry = { id: 'bk-' + now().toString(36) + '-' + randomId(4), at: iso(), device: cfg.deviceId, group: grp, reason: reason, side: side, items: items };
+      var lb = readJSON(K.backup);
+      if (!lb || !Array.isArray(lb.entries)) lb = { v: 1, entries: [] };
+      lb.entries.push(entry); lb.entries = lb.entries.slice(-5); lb.at = iso();
+      if (!writeJSON(K.backup, lb)) writeJSON(K.backup, { v: 1, at: iso(), entries: [entry] });
+      var bkey = backupKey(grp);
+      if (!REG[bkey]) rule(bkey, 'kid', 'family:backup');
+      if (size > BACKUP_MAX) { note('backup', grp, 'the other copy is too big for the family backup; it is kept on this laptop only'); return true; }
+      var cur = readJSON(bkey);
+      setRaw(bkey, backupJSON((cur && Array.isArray(cur.entries) ? cur.entries : []).concat([entry])));
+      st.pending[bkey] = now();
+      return true;
+    }
+    /**
+     * Kid keys another laptop changed (from a pull, a put conflict, or a first connect). Unchanged here: take the cloud
+     * value. Changed on both: family keys merge (union rules above); an app's progress goes to the higher score (its
+     * registered score function), and the other copy goes to the 30-day backup. Returns the keys whose value changed here.
+     */
+    function reconcileKid(items, source, ctx) {
+      ctx = ctx || {};
+      var changed = [], appItems = {}, summaries = [], decisions = {};
+      each(items, function (it) {
+        var k = it && it.key, r = REG[k];
+        if (!r || r.owner !== 'kid') return;
+        var rev = Number(it.rev) || 0, cloud = it.value == null ? null : String(it.value), local = getRaw(k);
+        if (source === 'pull' && rev <= (st.base[k] || 0)) return;
+        var mine = st.pushed[k] === undefined ? local != null : hashStr(local) !== st.pushed[k];
+        if (k.indexOf('familyApps.summary.') === 0) { summaries.push({ k: k, local: local, cloud: cloud, rev: rev, mine: mine }); return; }
+        if (!mine || local == null) {
+          if (cloud !== local) {
+            adopt(k, cloud, rev); changed.push(k);
+            if (ctx.report && cloud != null) addTo(ctx.report.downloaded, r.group);
+            if (r.group.indexOf('family') !== 0) armGuard(r.group, [k]);
+          } else setBase(k, cloud, rev);
+          return;
+        }
+        if (cloud == null) { st.base[k] = rev; st.pending[k] = now(); return; }
+        if (cloud === local) { setBase(k, cloud, rev); delete st.pending[k]; return; }
+        var fn = mergerFor(k);
+        if (fn) {
+          var m = fn(local, cloud, k === K.walletTime ? st.baseVals[k] : undefined);
+          if (m === cloud) adopt(k, cloud, rev);
+          else { setRaw(k, m); setBase(k, cloud, rev); st.pending[k] = now(); }
+          if (m !== local) changed.push(k);
+          if (ctx.report) addTo(ctx.report.merged, k);
+          if (r.group !== 'family:backup' && k !== K.health) note('merge', k, 'combined with ' + (it.device && it.device === cfg.deviceId ? 'an older copy from this laptop' : 'another laptop'));
+          return;
+        }
+        (appItems[r.group] = appItems[r.group] || []).push({ k: k, cloud: cloud, rev: rev, device: it.device });
+      });
+      keysOf(appItems).forEach(function (grp) {
+        var list = appItems[grp], self = list.every(function (x) { return x.device && x.device === cfg.deviceId; });
+        var L = {}, C = {};
+        each(GROUPS[grp] ? GROUPS[grp].progress : [], function (k) { var v = getRaw(k); if (v != null) { L[k] = v; C[k] = v; } });
+        list.forEach(function (x) { if (x.cloud == null) delete C[x.k]; else C[x.k] = x.cloud; });
+        var ls = score(grp, L), cs = score(grp, C), win = ls >= cs ? 'local' : 'cloud', loser = {};
+        decisions[grp] = win;
+        list.forEach(function (x) { loser[x.k] = win === 'cloud' ? L[x.k] : x.cloud; });
+        if (!self && backupLoser(grp, loser, source === 'connect' ? 'first-connect' : 'conflict', win === 'cloud' ? 'this-laptop' : 'other-laptop') && ctx.report) addTo(ctx.report.backups, grp);
+        if (win === 'cloud') {
+          list.forEach(function (x) { adopt(x.k, x.cloud, x.rev); changed.push(x.k); });
+          armGuard(grp, list.map(function (x) { return x.k; }));
+          if (ctx.report) addTo(ctx.report.downloaded, grp);
+        } else {
+          list.forEach(function (x) { setBase(x.k, x.cloud, x.rev); st.pending[x.k] = now(); });
+          if (ctx.report) addTo(ctx.report.uploaded, grp);
+        }
+        if (!self) note('merge', grp, (win === 'cloud' ? 'kept the other laptop\u2019s progress' : 'kept this laptop\u2019s progress') + ' (' + Math.round(ls) + ' here vs ' + Math.round(cs) + ' there); the other copy is in the 30-day backup');
+      });
+      summaries.forEach(function (s) {
+        var app = s.k.slice('familyApps.summary.'.length).replace(/\.v1$/, ''), useCloud;
+        if (!s.mine || s.local == null) useCloud = true;
+        else if (s.cloud == null) useCloud = false;
+        else if (decisions[app]) useCloud = decisions[app] === 'cloud';
+        else { var a = parse(s.local), c = parse(s.cloud); useCloud = tms(c && c.updatedAt) > tms(a && a.updatedAt); }
+        if (useCloud) { if (s.cloud !== s.local) { adopt(s.k, s.cloud, s.rev); changed.push(s.k); } else setBase(s.k, s.cloud, s.rev); }
+        else { setBase(s.k, s.cloud, s.rev); if (s.local !== s.cloud) st.pending[s.k] = now(); }
+      });
+      return changed;
+    }
+
+    // ---------- fresh-download guard: the first minute after his progress came from another laptop ----------
+    var GUARD_MS = 60000;
+    function note(kind, key, text) {
+      if (!st) return;
+      if (!Array.isArray(st.log)) st.log = [];
+      st.log.push({ at: iso(), kind: kind, key: key, note: text });
+      if (st.log.length > 20) st.log = st.log.slice(-20);
+      try { if (root.console && root.console.info) root.console.info('[family-sync] ' + kind + ' ' + key + ': ' + text); } catch (e) {}
+    }
+    function groupScoreNow(grp) { var vals = {}; each(GROUPS[grp] ? GROUPS[grp].progress : [], function (k) { var v = getRaw(k); if (v != null) vals[k] = v; }); return score(grp, vals); }
+    function armGuard(grp, keys) {
+      if (!st || !keys.length || !GROUPS[grp] || grp.indexOf('family') === 0) return;
+      if (!st.fresh || !st.fresh.groups) st.fresh = { at: now(), until: 0, groups: {} };
+      var g = st.fresh.groups[grp] || (st.fresh.groups[grp] = { keys: {} });
+      each(keys, function (k) { g.keys[k] = hashStr(getRaw(k)); if (g.stale) delete g.stale[k]; });
+      g.score = groupScoreNow(grp); g.at = now(); g.until = now() + GUARD_MS;
+      st.fresh.until = Math.max(st.fresh.until || 0, g.until);
+    }
+    /** Hold back a just-downloaded progress key if, within the first minute, it was overwritten with LESS progress than
+     *  the downloaded copy (typically an app saving stale in-memory state). The overwrite goes to the backup, and the
+     *  cloud copy is restored. */
+    function guard() {
+      var f = st && st.fresh;
+      if (!f || !f.groups) return [];
+      var t = now(), held = [];
+      for (var grp in f.groups) {
+        var g = f.groups[grp], until = g.until || f.until || 0;
+        for (var k in g.keys) {
+          if (g.stale && g.stale[k]) { delete st.pending[k]; held.push(k); continue; }
+          if (t > until) { delete g.keys[k]; continue; }
+          if (hashStr(getRaw(k)) === g.keys[k]) continue;
+          var sc = groupScoreNow(grp);
+          if (sc < g.score) {
+            g.stale = g.stale || {}; g.stale[k] = 1; delete st.pending[k]; held.push(k);
+            var lv = {}; lv[k] = getRaw(k);
+            backupLoser(grp, lv, 'stale-save', 'this-laptop');
+            note('guard', k, 'held back: less progress than the copy downloaded ' + Math.round((t - (g.at || f.at || t)) / 1000) + ' s ago (' + Math.round(sc) + ' < ' + Math.round(g.score) + '); the overwrite is in the backup');
+          } else delete g.keys[k]; // real new progress on top of the download: let it go up
+        }
+        if (!keysOf(g.keys).length) delete f.groups[grp];
+      }
+      if (!keysOf(f.groups).length) st.fresh = null;
+      return held;
+    }
+    function restoreHeld(keys) {
+      if (!keys.length) return Promise.resolve([]);
+      return call('get', { keys: keys }).then(function (res) {
+        var back = [];
+        each(res.items, function (it) {
+          if (!it || it.value == null || keys.indexOf(it.key) < 0) return;
+          var v = String(it.value);
+          adopt(it.key, v, it.rev);
+          if (st.fresh && st.fresh.groups) for (var grp in st.fresh.groups) { var g = st.fresh.groups[grp]; if (g.stale) delete g.stale[it.key]; if (g.keys[it.key]) g.keys[it.key] = hashStr(v); }
+          back.push(it.key);
+          note('guard', it.key, 'restored the cloud copy');
+        });
+        if (back.length) dispatch(back, 'guard');
+        return back;
+      });
+    }
+    function healthSig() { return (st.paused || '') + '|' + keysOf(st.tooBig).sort().join(','); }
+    /** Kid laptop: its own entry in familyApps.syncHealth.v1 ({v:2, devices:{id: …}}). Written only on change. */
+    function writeHealth() {
+      if (!cfg || cfg.role !== 'kid' || !st) return false;
+      var sig = healthSig();
+      if (st.healthSig === sig) return false;
+      var big = keysOf(st.tooBig).sort().map(function (k) { var v = getRaw(k); return { key: k, size: v == null ? 0 : v.length }; });
+      var why = st.paused || (big.length ? 'too-big' : ''), m = healthMap(readJSON(K.health));
+      m[cfg.deviceId] = { device: cfg.deviceId, at: iso(), state: why ? 'paused' : 'ok', paused: why, tooBig: big, ver: VERSION };
+      setRaw(K.health, JSON.stringify({ v: 2, devices: m }));
+      st.healthSig = sig;
+      return true;
     }
     function buildItems(keys, keepalive) {
       return Promise.all(keys.map(function (k) {
         if (st.tooBig[k] && st.tooBig[k] === hashStr(getRaw(k))) return null;
         var v = getRaw(k);
-        return encodeOut(k, v).then(function (ev) { return { key: k, value: ev, hash: hashStr(v) }; }, function () { return null; });
+        return encodeOut(k, v).then(function (ev) { return { key: k, value: ev, hash: hashStr(v), plain: v }; }, function () { return null; });
       })).then(function (items) {
         var batches = [[]], size = 0, limit = keepalive ? 60000 : 400000;
         each(items, function (it) {
@@ -402,45 +816,65 @@
         return batches;
       });
     }
+    function itemOut(it) {
+      var o = { key: it.key, value: it.value };
+      if (cfg.role === 'kid') o.baseRev = st.base[it.key] || 0; // 1.1 servers check it; 1.0 servers ignore it
+      return o;
+    }
+    /** Send this device's changed keys. Kid laptops send baseRev; a conflict is merged here and sent again (3 rounds). */
     function push(opts) {
       opts = opts || {};
-      var keys = keysOf(st.pending);
-      if (!keys.length && !opts.claim) return Promise.resolve(0);
-      if (st.paused && !opts.claim) return Promise.resolve(0);
-      return buildItems(keys, false).then(function (batches) {
-        var count = 0, first = true;
-        return seq(batches, function (batch) {
-          if (!batch.length && !(opts.claim && first)) return;
-          var payload = { items: batch.map(function (it) { return { key: it.key, value: it.value }; }) };
-          if (opts.claim && first) payload.claim = true;
-          first = false;
-          return call('put', payload, {}).then(function (res) {
-            var refused = res.refused || {};
-            each(batch, function (it) {
-              if (refused[it.key]) { if (refused[it.key] === 'too-large') { st.tooBig[it.key] = it.hash; delete st.pending[it.key]; } else st.lastError = 'refused:' + refused[it.key]; return; }
-              st.pushed[it.key] = it.hash; count++;
-              if (hashStr(getRaw(it.key)) === it.hash) delete st.pending[it.key];
+      if (st.paused) return Promise.resolve(0);
+      var rounds = 0, count = 0;
+      function round() {
+        var keys = keysOf(st.pending);
+        if (!keys.length || rounds++ >= 3) return Promise.resolve(count);
+        return buildItems(keys, false).then(function (batches) {
+          var conflicts = [];
+          return seq(batches, function (batch) {
+            if (!batch.length) return;
+            var payload = { items: batch.map(itemOut) };
+            if (cfg.role === 'kid') payload.claim = true; // a 1.0 server keeps one kid writer: every 1.1 laptop claims it
+            return call('put', payload, {}).then(function (res) {
+              var refused = res.refused || {}, cf = res.conflicts || {};
+              if (res.server) st.server = res.server;
+              each(batch, function (it) {
+                var why = refused[it.key];
+                if (why) {
+                  if (why === 'too-large') { st.tooBig[it.key] = it.hash; delete st.pending[it.key]; }
+                  else if ((why === 'conflict' || why === 'stale') && cf[it.key]) conflicts.push({ key: it.key, value: cf[it.key].value, rev: cf[it.key].rev, device: cf[it.key].device });
+                  else st.lastError = 'refused:' + why;
+                  return;
+                }
+                st.pushed[it.key] = it.hash; count++;
+                if (res.revs && typeof res.revs[it.key] === 'number') st.base[it.key] = res.revs[it.key];
+                if (it.key === K.walletTime) st.baseVals[it.key] = it.plain;
+                if (hashStr(getRaw(it.key)) === it.hash) delete st.pending[it.key];
+              });
             });
-            if (opts.claim) st.paused = '';
+          }).then(function () {
+            if (!conflicts.length) return count;
+            var ch = reconcileKid(conflicts, 'conflict');
+            if (ch.length) dispatch(ch, 'pull');
+            return round();
           });
-        }).then(function () { return count; });
-      }).catch(function (e) {
-        if (e && e.code === 'not-writer') { st.paused = 'not-writer'; st.lastError = 'Another laptop is now his main device.'; }
-        throw e;
-      });
+        });
+      }
+      return round();
     }
     function dashboardKeys() {
       var out = [];
-      for (var k in REG) if (REG[k].owner !== 'local' && (REG[k].group.indexOf('family') === 0 || REG[k].owner === 'grownup')) out.push(k);
+      for (var k in REG) if (REG[k].owner !== 'local' && REG[k].group !== 'family:backup' && (REG[k].group.indexOf('family') === 0 || REG[k].owner === 'grownup')) out.push(k);
       return out.sort();
     }
     function pull(opts) {
       opts = opts || {};
       var q = {}, sig;
-      if (cfg.role === 'kid') { q.role = 'grownup'; sig = 'kid'; } else { q.keys = dashboardKeys(); q.devices = true; sig = hashStr(q.keys.join(',')); }
+      if (cfg.role === 'kid') sig = 'kid-1.1'; else { q.keys = dashboardKeys(); q.devices = true; sig = hashStr(q.keys.join(',')); }
       var since = st.keysSig === sig ? cfg.lastRev || 0 : 0;
-      if (since) q.sinceRev = since;
+      if (since) { q.sinceRev = since; if (cfg.role === 'kid') q.exceptDevice = cfg.deviceId; }
       return call('get', q, { timeoutMs: opts.timeoutMs }).then(function (res) {
+        if (res.server) st.server = res.server;
         if (since && typeof res.rev === 'number' && res.rev < since) { cfg.lastRev = 0; st.keysSig = ''; return pull(opts); }
         return applyItems(res.items || [], 'pull', res.devices).then(function (changed) {
           if (typeof res.rev === 'number') { cfg.lastRev = res.rev; saveConfig(); }
@@ -462,20 +896,25 @@
       }, function () { st.lastError = 'Could not unlock ' + it.key + ' (family link changed?)'; return false; });
     }
     function applyItems(items, source, devices) {
-      var changed = [], mir = cfg.role === 'grownup' ? loadMirror() : null, mirDirty = false;
+      var changed = [], kidItems = [], mir = cfg.role === 'grownup' ? loadMirror() : null, mirDirty = false;
       return seq(items, function (it) {
         if (!it || typeof it.key !== 'string') return;
         var o = ownerOf(it.key) || (it.role === 'grownup' ? 'grownup' : it.role === 'kid' ? 'kid' : 'local');
         if (o === 'local') return;
         if (cfg.role === 'kid') {
-          if (o !== 'grownup') return; // his own data is never overwritten by a pull
-          return applySetting(it).then(function (ch) { if (ch) changed.push(it.key); });
+          if (o === 'grownup') return applySetting(it).then(function (ch) { if (ch) changed.push(it.key); });
+          if (!REG[it.key]) return;
+          // our own write: just learn its rev (unless this laptop's last push for it was lost)
+          if (it.device === cfg.deviceId && hashStr(it.value == null ? null : String(it.value)) === st.pushed[it.key]) { st.base[it.key] = Math.max(st.base[it.key] || 0, Number(it.rev) || 0); return; }
+          kidItems.push(it);
+          return;
         }
         if (o === 'kid') { mir.items[it.key] = { value: it.value, rev: it.rev, updatedAt: it.updatedAt, device: it.device }; mirDirty = true; changed.push(it.key); return; }
         if (it.device === cfg.deviceId) { st.applied[it.key] = { rev: it.rev || 0, hash: hashStr(getRaw(it.key)) }; return; }
         if (st.pending[it.key]) return; // this grown-up device has a newer edit waiting to go up
         return applySetting(it).then(function (ch) { if (ch) changed.push(it.key); });
       }).then(function () {
+        if (kidItems.length) changed = changed.concat(reconcileKid(kidItems, source));
         if (mir && (mirDirty || devices)) { if (devices) mir.devices = devices; mir.at = iso(); writeJSON(K.mirror, mir); if (devices && !mirDirty) changed.push('devices'); }
         if (changed.length) {
           dispatch(changed, source);
@@ -499,13 +938,24 @@
       var rw = readJSON(K.rewards);
       if (!rw || !rw.wallet || typeof rw.wallet !== 'object' || !FW || !FW.settings || !FW.setSettings) return false;
       var cur = FW.settings(), patch = {}, n = 0;
-      ['mode', 'appsInSet', 'perApp', 'costs', 'minutesPerShard', 'dailyTimeCap', 'comebackDailyCap'].forEach(function (f) {
+      ['mode', 'appsInSet', 'perApp', 'costs', 'minutesPerShard', 'dailyTimeCap', 'comebackDailyCap', 'noRepeats', 'onceDailyCap'].forEach(function (f) {
         if (rw.wallet[f] === undefined) return;
         if (JSON.stringify(rw.wallet[f]) !== JSON.stringify(cur[f])) { patch[f] = rw.wallet[f]; n++; }
       });
       if (!n) return false;
       FW.setSettings(patch);
       return true;
+    }
+    /** Mark the ledger event FamilyWallet just wrote for a parent request with the request id ("rq:<id>"), so that if two
+     *  laptops both apply it before they sync, the wallet merge keeps it once. */
+    function tagRequestEvent(id, reason) {
+      var w = readJSON(K.wallet);
+      if (!w || !Array.isArray(w.events)) return false;
+      for (var i = w.events.length - 1; i >= 0 && i >= w.events.length - 5; i--) {
+        var e = w.events[i];
+        if (e && e.tag === 'parent' && !e.ref && String(e.reason) === String(reason)) { e.ref = 'rq:' + id; return writeJSON(K.wallet, w); }
+      }
+      return false;
     }
     function applyParentRequests() {
       if (!loadConfig()) return Promise.resolve({ applied: 0 });
@@ -525,6 +975,7 @@
           mark(r.id, 'adjust', null); // first, so a crash can never apply it twice
           var ok = false;
           try { ok = r.app === 'rupees' ? FW.adjustRupees(amount, reason) : FW.adjust(r.app, amount, reason); } catch (e) {}
+          if (ok) tagRequestEvent(r.id, reason);
           done.done[r.id].ok = !!ok; writeJSON(K.requestsDone, done); applied++;
         });
         each(apr && apr.approvals, function (r) {
@@ -551,23 +1002,32 @@
       cycling = withLock('familyApps.sync', function () {
         loadState();
         snapshot();
+        var held = guard();
         var t = now(), pend = keysOf(st.pending).length > 0;
         var pullDue = o.force || o.first || o.focus || (visible() && t - (st.lastPullAt || 0) >= 60000);
         var pushDue = (pend && !st.paused) || o.claim;
         if (!o.force && !o.focus && !o.online && t < (st.nextRetryAt || 0)) { saveState(); return setStatus(online() ? 'error' : 'offline'); }
-        if (!pullDue && !pushDue) { saveState(); return setStatus(pend ? 'pending' : st.lastOkAt ? 'synced' : 'idle'); }
+        if (!pullDue && !pushDue && !held.length) { if (writeHealth()) later(function () { cycle({ force: true }); }, 50); saveState(); return setStatus(pend ? 'pending' : st.lastOkAt ? 'synced' : 'idle'); }
         if (!online()) { saveState(); return setStatus('offline'); }
         setStatus('syncing');
         var first = o.first && cfg.role === 'kid' && !driftChecked ? driftRepair().catch(function () {}) : Promise.resolve();
-        return first.then(function () { return pushDue ? push({ claim: o.claim }) : 0; })
+        return first.then(function () { return held.length ? restoreHeld(held) : null; })
+          .then(function () { return pushDue ? push({ claim: o.claim }) : 0; })
           .then(function () { return pullDue ? pull({ timeoutMs: o.first ? 3000 : 20000 }) : null; })
           .then(function () {
             st.failCount = 0; st.nextRetryAt = 0; st.lastOkAt = now(); if (!st.paused && st.lastError && st.lastError.indexOf('refused') < 0) st.lastError = '';
+            if (writeHealth()) later(function () { cycle({ force: true }); }, 50);
             saveState();
             return setStatus(keysOf(st.pending).length && !st.paused ? 'pending' : 'synced');
           }, function (e) {
+            if (o.first && !o.retry && e && e.code === 'timeout') {
+              // an Apps Script cold start can take longer than the 3 s first pull: keep "syncing…" and retry at once
+              saveState(); later(function () { cycle({ force: true, retry: true }); }, 0);
+              return setStatus('syncing');
+            }
             st.failCount = (st.failCount || 0) + 1; st.nextRetryAt = now() + backoff(st.failCount);
             st.lastError = (e && (e.code || e.message)) || 'error';
+            writeHealth();
             saveState();
             return setStatus(e && (e.code === 'network' || e.code === 'timeout') ? 'offline' : 'error');
           });
@@ -582,14 +1042,14 @@
     function flush() {
       // page hidden / closing: send pending changes with keepalive (fire-and-forget; next start re-checks)
       if (!loadConfig()) return;
-      loadState(); snapshot(); saveState();
+      loadState(); snapshot(); guard(); saveState();
       if (st.paused || !authCache[cfg.secret]) return;
       var keys = keysOf(st.pending).filter(function (k) { return !REG[k] || REG[k].codec === 'raw'; });
       if (!keys.length) return;
       var items = [], size = 0;
-      each(keys, function (k) { var v = getRaw(k), len = (v == null ? 0 : v.length) + k.length + 40; if (v != null && v.length > MAX_VALUE) return; if (size + len <= 60000) { items.push({ key: k, value: v }); size += len; } });
+      each(keys, function (k) { var v = getRaw(k), len = (v == null ? 0 : v.length) + k.length + 40; if (v != null && v.length > MAX_VALUE) return; if (size + len <= 60000) { items.push(itemOut({ key: k, value: v })); size += len; } });
       if (!items.length) return;
-      var body = bodyFor('put', { items: items }, cfg);
+      var body = bodyFor('put', cfg.role === 'kid' ? { items: items, claim: true } : { items: items }, cfg);
       body.auth = authCache[cfg.secret];
       try { var p = transport()(cfg.endpoint, body, { keepalive: true, timeoutMs: 10000 }); if (p && p.catch) p.catch(function () {}); } catch (e) {}
     }
@@ -650,58 +1110,43 @@
     function begin(c) {
       cfg = c; saveConfig(); st = freshState(); saveState(); driftChecked = true;
     }
+    /**
+     * First connect of a kid laptop (the first one or an extra one): the same merge as a conflict, so the play on this
+     * laptop and the play already in the family copy both survive. Keys only here go up; keys only in the cloud come
+     * down; keys in both merge (family keys: union rules; app progress: the higher score wins, the other copy goes to
+     * the 30-day backup).
+     */
     function firstConnectKid() {
-      var report = { uploaded: [], downloaded: [], same: [], backups: [], settings: [] };
-      var groups = {};
-      keysOwnedBy('kid').forEach(function (k) { var g = REG[k].group; (groups[g] = groups[g] || []).push(k); });
-      var all = [];
-      for (var g in groups) all = all.concat(groups[g]);
-      return call('get', { keys: all }).then(function (res) {
-        var cloud = {};
-        each(res.items, function (it) { if (it && it.value != null && ownerOf(it.key) === 'kid') cloud[it.key] = String(it.value); });
-        var plan = [], backup = { v: 1, at: iso(), entries: [] };
-        Object.keys(groups).forEach(function (grp) {
-          var keys = groups[grp], L = {}, C = {};
-          each(keys, function (k) { var v = getRaw(k); if (v != null) L[k] = v; if (cloud[k] != null) C[k] = cloud[k]; });
-          var d = decideMerge(grp, keys, L, C);
-          if (d.use === 'none') return;
-          if (d.use === 'local' && keysOf(C).length) backup.entries.push({ group: grp, side: 'cloud', items: C });
-          if (d.use === 'cloud' && keysOf(L).length) backup.entries.push({ group: grp, side: 'local', items: L });
-          plan.push({ grp: grp, keys: keys, L: L, C: C, d: d });
+      var report = { uploaded: [], downloaded: [], merged: [], same: [], backups: [], settings: [] };
+      var kidKeys = keysOwnedBy('kid'), r0 = 0;
+      return call('get', { keys: kidKeys }).then(function (res) {
+        if (res.server) st.server = res.server;
+        var cloud = {}, items = [];
+        each(res.items, function (it) { if (it && ownerOf(it.key) === 'kid') cloud[it.key] = it; });
+        st.baseVals[K.walletTime] = null; // a new laptop shares no history with the family copy: its minutes add up
+        kidKeys.forEach(function (k) {
+          var L = getRaw(k), it = cloud[k];
+          if (!it || it.value == null) { if (L != null) { st.pending[k] = now(); addTo(report.uploaded, REG[k].group); } return; }
+          if (L != null && String(it.value) === L) { setBase(k, L, it.rev); addTo(report.same, REG[k].group); return; }
+          items.push(it);
         });
-        if (backup.entries.length && !writeJSON(K.backup, backup)) {
-          plan.forEach(function (p) { if (p.d.use === 'cloud') p.d = { use: 'local', reason: 'no-room-for-backup' }; });
-        }
-        plan.forEach(function (p) {
-          if (p.d.use === 'same') { each(p.keys, function (k) { st.pushed[k] = hashStr(getRaw(k)); }); report.same.push(p.grp); return; }
-          if (p.d.use === 'local') {
-            each(p.keys, function (k) {
-              if (p.L[k] != null) st.pending[k] = now();
-              else if (p.C[k] != null) { setRaw(k, p.C[k]); st.pushed[k] = hashStr(p.C[k]); } // keep cloud-only keys: never lose data
-            });
-            report.uploaded.push(p.grp);
-          } else {
-            each(p.keys, function (k) {
-              if (p.C[k] != null) { setRaw(k, p.C[k]); st.pushed[k] = hashStr(p.C[k]); }
-              else if (p.L[k] != null) st.pending[k] = now();
-            });
-            report.downloaded.push(p.grp);
-          }
-          if (backup.entries.some(function (e) { return e.group === p.grp; })) report.backups.push(p.grp);
-        });
-        saveState();
-        return push({ claim: true });
+        var changed = reconcileKid(items, 'connect', { report: report });
+        r0 = typeof res.rev === 'number' ? res.rev : 0;
+        snapshot(); saveState();
+        if (changed.length) dispatch(changed, 'connect');
+        return push({});
       }).then(function () {
         return call('get', { role: 'grownup' });
       }).then(function (res) {
         return applyItems(res.items || [], 'connect').then(function (ch) {
           report.settings = ch;
-          if (typeof res.rev === 'number') { cfg.lastRev = res.rev; saveConfig(); }
-          st.keysSig = 'kid'; st.lastPullAt = now(); st.lastOkAt = now(); saveState();
+          cfg.lastRev = r0; saveConfig(); // the next pull also sees anything another laptop wrote meanwhile
+          st.keysSig = 'kid-1.1'; st.lastPullAt = now(); st.lastOkAt = now(); writeHealth(); saveState();
         });
       }).then(function () { return applyParentRequests(); }).then(function () { return report; });
     }
-    /** Join this browser to the family (the join page or the Connect panel). A wrong secret is refused before anything is saved. */
+    /** Join this browser to the family (the join page or the Connect panel). A wrong secret is refused before anything is
+     *  saved. Opening the link again on a laptop that is already in the family just syncs (nothing is merged twice). */
     function connect(o) {
       o = o || {};
       var r = o.role === 'grownup' ? 'grownup' : 'kid';
@@ -709,8 +1154,13 @@
       if (!validFamilyId(familyId) || !validSecret(secret)) return Promise.reject(err('bad-link', 'That family link is not complete. Copy it again, all of it.'));
       if (!validEndpoint(endpoint)) return Promise.reject(err('no-endpoint', 'That link does not say where the family data lives.'));
       var old = loadConfig();
-      var c = { v: 1, endpoint: endpoint, familyId: familyId, secret: secret, deviceId: (old && old.deviceId) || newDeviceId(), role: r, connectedAt: iso(), lastRev: 0 };
+      var again = !!(old && old.familyId === familyId && old.secret === secret && old.role === r);
+      var c = again ? old : { v: 1, endpoint: endpoint, familyId: familyId, secret: secret, deviceId: (old && old.deviceId) || newDeviceId(), role: r, connectedAt: iso(), lastRev: 0 };
       return call('get', { keys: [K.pin] }, { cfg: c, timeoutMs: 20000 }).then(function () {
+        if (again) {
+          loadState();
+          return cycle({ force: true }).then(function () { return { again: true, uploaded: [], downloaded: [], merged: [], same: [], backups: [], settings: [] }; });
+        }
         begin(c);
         return r === 'kid' ? firstConnectKid() : pull().then(function (ch) { return { settings: ch }; });
       }).then(function (report) {
@@ -841,7 +1291,7 @@
         dot.style.display = s.connected ? 'inline-flex' : 'none';
         dot.textContent = s.text + (s.role === 'grownup' && opts && opts.showRole ? ' · grown-up' : '');
         dot.style.color = color[s.state] || 'inherit';
-        dot.title = s.connected ? 'Family sync: ' + s.state + (s.lastSyncAt ? ' · last ' + new Date(s.lastSyncAt).toLocaleString() : '') + (s.lastError ? ' · ' + s.lastError : '') : '';
+        dot.title = s.connected ? 'Family sync: ' + s.state + (s.lastSyncAt ? ' · last ' + new Date(s.lastSyncAt).toLocaleString() : '') + (s.lastError ? ' · ' + s.lastError : '') + (s.tooBig && s.tooBig.length ? ' · too big to sync: ' + s.tooBig.join(', ') : '') : '';
         dot.setAttribute('data-state', s.state);
       }
       update();
@@ -905,9 +1355,10 @@
       connect: connect, createFamily: createFamily, ping: ping, pairCreate: pairCreate, pairRedeem: pairRedeem, disconnect: disconnect,
       parseJoin: parseJoin, joinLink: joinLink, endpointFor: endpointFor, familyIdFor: familyIdFor,
       setSetting: setSetting, request: request, mirror: mirror, dashboardKeys: dashboardKeys,
+      log: function () { if (!loadConfig()) return []; if (!st) loadState(); return (st.log || []).slice(); },
       config: function () { if (!loadConfig()) return null; var c = {}; for (var k in cfg) if (k !== 'secret') c[k] = cfg[k]; return c; },
       rules: function () { var o = {}; for (var k in REG) o[k] = { owner: REG[k].owner, group: REG[k].group, codec: REG[k].codec, keepLocal: REG[k].keepLocal }; return o; },
-      _t: { hashStr: hashStr, keepLocalMerge: keepLocalMerge, stripLocal: stripLocal, decideMerge: decideMerge, score: score, familyKeys: familyKeys, aesEncrypt: aesEncrypt, aesDecrypt: aesDecrypt, pinHash: pinHash, b64u: b64u, unb64u: unb64u, weekOf: weekOf, call: call, cycle: cycle },
+      _t: { hashStr: hashStr, keepLocalMerge: keepLocalMerge, stripLocal: stripLocal, decideMerge: decideMerge, score: score, familyKeys: familyKeys, aesEncrypt: aesEncrypt, aesDecrypt: aesDecrypt, pinHash: pinHash, b64u: b64u, unb64u: unb64u, weekOf: weekOf, call: call, cycle: cycle, guard: function () { return guard(); }, GUARD_MS: GUARD_MS, mergeWallet: mergeWallet, mergeTickets: mergeTickets, mergeInventory: mergeInventory, mergeTime: mergeTime, mergeDone: mergeDone, mergeHealth: mergeHealth, mergeBackup: mergeBackup, state: function () { return st; } },
       __new: function () { return make(); },
     };
     return FS;

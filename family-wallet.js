@@ -1,6 +1,15 @@
 /*!
- * family-wallet.js — the Family Wallet shared by Math Arena, Language Quest, Code Quest and Music Quest.
+ * family-wallet.js 1.2 — the Family Wallet shared by Math Arena, Language Quest, Code Quest and Music Quest.
  * Copy this file unchanged into every app (same origin, same localStorage). No dependencies, no framework, no network.
+ *
+ * 1.2 ANTI-FARMING ("rewards only for new learning"; settings.noRepeats, on by default)
+ *   earnOnce(app, onceId, shards, label) -> { paid, banked, reason: 'repeat' | 'cap' | 'guessing' | null }
+ *     pays the first time (app, onceId) is ever earned (event id "once:<app>:<onceId>", plus wallet.once), at most
+ *     settings.onceDailyCap (6) such shards per app per day; more is BANKED (wallet.bank) and released on later days.
+ *   rupeesOnce(app, itemId, rupees, label) -> rupees paid: only the first correct answer on itemId within 30 days
+ *     (wallet.seenRupee, at most 5,000 ids per app). Repeats pay 0 (counted in wallet.daily, not in the ledger).
+ *   tickActive(app, ms, { repeat: true }) / startTracker(app, { isRepeat }): review minutes count, earn no shards.
+ *   releaseBanked(app), policy(), daily(). The 1.1 calls (finishUnit, beatBoss, answer, earn, ...) are unchanged.
  *
  * LOAD IT
  *   <script src="family-wallet.js"></script>            -> window.FamilyWallet
@@ -63,7 +72,8 @@
   // ===================================================================================================================
   // CORE: storage, the shared ledger (shards + rupees), earning rules, rewards, tickets, the market and the inventory.
   // ===================================================================================================================
-  var VERSION = 1;
+  var VERSION = 1; // the data version of familyApps.wallet.v1
+  var MODULE_VERSION = '1.2.0';
   var KEYS = {
     wallet: 'familyApps.wallet.v1',
     inventory: 'familyApps.inventory.v1',
@@ -106,6 +116,8 @@
     guessWindowMs: 5000, // 3+ wrong answers inside this window = rapid guessing
     guessCooldownMs: 60000, // ... then no shards or rupees for this long
     idleMs: 60000, // the tracker counts time only with an interaction in the last minute
+    noRepeats: true, // 1.2: earnOnce / rupeesOnce / repeat minutes pay only for new learning
+    onceDailyCap: 6, // 1.2: at most this many earnOnce shards per app per day; more is banked for later days
   };
   var DEFAULT_REWARDS = [
     { id: 'youtube', emoji: '📺', text: '15 minutes of YouTube' },
@@ -245,6 +257,8 @@
     out.guessWindowMs = clampInt(s.guessWindowMs, 1000, 60000, d.guessWindowMs);
     out.guessCooldownMs = clampInt(s.guessCooldownMs, 0, 600000, d.guessCooldownMs);
     out.idleMs = clampInt(s.idleMs, 10000, 600000, d.idleMs);
+    out.noRepeats = s.noRepeats !== false;
+    out.onceDailyCap = clampInt(s.onceDailyCap, 0, 50, d.onceDailyCap);
     return out;
   }
 
@@ -486,8 +500,159 @@
       return amount;
     }) || 0;
   }
+  // ---------- 1.2: rewards only for new learning ----------
+  function dayNum(t) { return Math.floor((t - new Date(t).getTimezoneOffset() * 60000) / 86400000); }
+  function bumpDaily(w, day, app, field, n) {
+    var dl = (w.daily = w.daily && typeof w.daily === 'object' ? w.daily : {});
+    var d = (dl[day] = dl[day] || {});
+    var a = (d[app] = d[app] || {});
+    a[field] = (a[field] || 0) + n;
+    var ks = Object.keys(dl).sort();
+    while (ks.length > 70) delete dl[ks.shift()];
+  }
+  function onceToday(w, app, day) {
+    return eventsOn(w, app, day, function (e) { return e.tag === 'once' || e.tag === 'onceBank'; });
+  }
+  function hasDueBank(w, app, day) {
+    var b = Array.isArray(w.bank) ? w.bank : [];
+    for (var i = 0; i < b.length; i++) if (b[i] && b[i].app === app && (b[i].total || 0) > (b[i].released || 0) && dayKey(timeOf(b[i].at)) < day) return true;
+    return false;
+  }
+  /** Release shards banked on earlier days, oldest first, within today's cap. Each release has a fixed id. */
+  function releaseBankIn(w, app) {
+    var bank = Array.isArray(w.bank) ? w.bank : [];
+    if (!bank.length) return 0;
+    var day = dayKey(now());
+    var room = Math.max(0, w.settings.onceDailyCap - onceToday(w, app, day));
+    var got = 0;
+    for (var i = 0; i < bank.length && room > 0; i++) {
+      var b = bank[i];
+      if (!b || b.app !== app || dayKey(timeOf(b.at)) >= day) continue;
+      var left = (b.total || 0) - (b.released || 0);
+      if (left <= 0) continue;
+      var n = Math.min(left, room);
+      b.released = (b.released || 0) + n;
+      var ev = addEvent(w, app, 'progress', n, String(b.label || 'Lesson') + ' (banked shards released)', 'onceBank', b.bid);
+      ev.id = b.bid + ':r' + b.released;
+      ev.total = b.total;
+      room -= n;
+      got += n;
+    }
+    w.bank = bank.filter(function (x) { return x && (x.total || 0) - (x.released || 0) > 0; });
+    if (got) bumpDaily(w, day, app, 'released', got);
+    return got;
+  }
+  /** Release banked shards now if any are due (apps may call this at start; writes only when something is released). */
+  function releaseBanked(app) {
+    if (!isApp(app)) return 0;
+    var w0 = load();
+    if (!hasDueBank(w0, app, dayKey(now()))) return 0;
+    var got = updateWallet(function (w) { var n = releaseBankIn(w, app); if (n) triforceDayCheck(w, app, dayKey(now())); return n || false; });
+    if (got) markDay(app);
+    return got || 0;
+  }
+  /**
+   * Pay shards for something he truly learned and passed, once: the first time (app, onceId) is ever earned, on any of
+   * his laptops. At most settings.onceDailyCap such shards per app per day; more is banked and released on later days.
+   * Returns { paid, banked, reason } (reason 'repeat' | 'cap' | 'guessing' | null).
+   */
+  function earnOnce(app, onceId, shards, label) {
+    var res = { paid: 0, banked: 0, reason: null };
+    if (!isApp(app) || onceId == null || String(onceId) === '') { res.reason = 'invalid'; return res; }
+    var id = String(onceId).slice(0, 120);
+    shards = Math.max(0, Math.min(20, Math.round(Number(shards) || 0)));
+    if (!shards) { res.reason = 'invalid'; return res; }
+    if (guessing(app)) { res.reason = 'guessing'; return res; }
+    var day = dayKey(now());
+    updateWallet(function (w) {
+      releaseBankIn(w, app);
+      var s = w.settings;
+      var o = (w.once = w.once && typeof w.once === 'object' ? w.once : {});
+      var m = (o[app] = o[app] && typeof o[app] === 'object' ? o[app] : {});
+      if (s.noRepeats && m[id] != null) { bumpDaily(w, day, app, 'repeat', 1); res.reason = 'repeat'; return true; }
+      var room = Math.max(0, s.onceDailyCap - onceToday(w, app, day));
+      var pay = Math.min(shards, room);
+      var bank = shards - pay;
+      var base = 'once:' + app + ':' + id + (s.noRepeats ? '' : ':' + now().toString(36) + Math.random().toString(36).slice(2, 6));
+      if (pay > 0) {
+        var ev = addEvent(w, app, 'progress', pay, label || 'Learned something new', 'once', id);
+        ev.id = base;
+        ev.want = shards;
+      }
+      if (bank > 0) {
+        w.bank = Array.isArray(w.bank) ? w.bank : [];
+        w.bank.push({ bid: base + ':bank', app: app, onceId: id, want: shards, total: bank, released: 0, label: String(label || 'Lesson').slice(0, 80), at: iso(now()) });
+        bumpDaily(w, day, app, 'banked', bank);
+        res.reason = 'cap';
+      }
+      if (s.noRepeats) m[id] = dayNum(now());
+      res.paid = pay;
+      res.banked = bank;
+      if (pay > 0) triforceDayCheck(w, app, day);
+      return true;
+    });
+    if (res.paid) {
+      markDay(app);
+      streakCheck(app);
+    }
+    return res;
+  }
+  /** Rupees only for the first correct answer on itemId within 30 days (per app; at most 5,000 ids remembered). */
+  function rupeesOnce(app, itemId, rupees, label) {
+    if (!isApp(app) || itemId == null || String(itemId) === '') return 0;
+    rupees = Math.max(0, Math.min(100, Math.round(Number(rupees) || 0)));
+    if (!rupees || guessing(app)) return 0;
+    var id = String(itemId).slice(0, 80);
+    var dn = dayNum(now());
+    var day = dayKey(now());
+    var paid = 0;
+    updateWallet(function (w) {
+      var s = w.settings;
+      var sr = (w.seenRupee = w.seenRupee && typeof w.seenRupee === 'object' ? w.seenRupee : {});
+      var m = (sr[app] = sr[app] && typeof sr[app] === 'object' ? sr[app] : {});
+      if (s.noRepeats && m[id] != null && dn - m[id] < 30) { bumpDaily(w, day, app, 'repeatRupees', 1); return true; }
+      m[id] = dn;
+      var keys = Object.keys(m);
+      if (keys.length > 5000) {
+        keys.sort(function (a, b) { return m[a] - m[b]; });
+        for (var i = 0; i < keys.length - 5000; i++) delete m[keys[i]];
+      }
+      paid = rupees;
+      for (var j = w.events.length - 1; j >= 0 && j >= w.events.length - 60; j--) {
+        var e = w.events[j];
+        if (e && e.tag === 'rupeeOnce' && e.app === app && e.ref === day) {
+          e.amount += rupees; // one growing ledger line per app per day keeps the ledger short
+          e.at = iso(now());
+          w.events.splice(j, 1);
+          w.events.push(e);
+          applyTotals(w, e, rupees);
+          return true;
+        }
+      }
+      addEvent(w, app, 'rupee', rupees, label || 'New correct answers', 'rupeeOnce', day);
+      return true;
+    });
+    return paid;
+  }
+  /** The parent's anti-farming settings, for UIs. */
+  function policy() {
+    var s = settings();
+    return { noRepeats: s.noRepeats, onceDailyCap: s.onceDailyCap, rupeeDays: 30, minutesPerShard: s.minutesPerShard, dailyTimeCap: s.dailyTimeCap, version: MODULE_VERSION };
+  }
+  /** Daily repeat / banked / released counters: { 'YYYY-MM-DD': { app: { repeat, repeatRupees, banked, released } } }. */
+  function daily() {
+    var w = load();
+    return w.daily && typeof w.daily === 'object' ? clone(w.daily) : {};
+  }
+  /** Shards waiting in the bank, per app. */
+  function bankedNow() {
+    var w = load(), out = {};
+    (Array.isArray(w.bank) ? w.bank : []).forEach(function (b) { if (b && isApp(b.app)) out[b.app] = (out[b.app] || 0) + Math.max(0, (b.total || 0) - (b.released || 0)); });
+    return out;
+  }
   /** Finished a unit of work (a quest, lesson, mission, build...): +2 shards and +10 rupees by default. */
   function finishUnit(app, reason, ref) {
+    releaseBanked(app);
     var s = settings();
     var r = earn(app, 'progress', s.points.unit, reason || 'Finished a lesson', { tag: 'unit', ref: ref });
     if (r.granted) earnRupees(app, s.rupees.unit, reason || 'Finished a lesson', { tag: 'unit', ref: ref });
@@ -495,6 +660,7 @@
   }
   /** Beat a boss, guardian or temple: +3 shards and +25 rupees by default. */
   function beatBoss(app, reason, ref) {
+    releaseBanked(app);
     var s = settings();
     var r = earn(app, 'progress', s.points.boss, reason || 'Beat a boss', { tag: 'boss', ref: ref });
     if (r.granted) earnRupees(app, s.rupees.boss, reason || 'Beat a boss', { tag: 'boss', ref: ref });
@@ -547,18 +713,22 @@
     }) || 0;
   }
   /** Add active learning time; every minutesPerShard minutes earn a time shard (dailyTimeCap a day). */
-  function tickActive(app, ms) {
+  function tickActive(app, ms, opts) {
     if (!isApp(app)) return 0;
     ms = Math.min(Number(ms) || 0, 120000); // one tick never adds more than two minutes (sleep / resume guard)
     if (ms <= 0 || guessing(app)) return 0;
     var t = readTime();
     var day = dayKey(now());
     var d = (t.days[day] = t.days[day] || {});
-    d[app] = (d[app] || 0) + ms;
-    writeTime(t);
     var s = settings();
-    var due = Math.min(s.dailyTimeCap, Math.floor(d[app] / (s.minutesPerShard * 60000)));
+    d[app] = (d[app] || 0) + ms;
+    // 1.2: review / graduated content: the minutes count (days[d][app]) but earn no shards (also kept in days[d].rep)
+    if (opts && opts.repeat && s.noRepeats) { d.rep = d.rep && typeof d.rep === 'object' ? d.rep : {}; d.rep[app] = (d.rep[app] || 0) + ms; }
+    writeTime(t);
+    var earnMs = d[app] - ((d.rep && d.rep[app]) || 0);
+    var due = Math.min(s.dailyTimeCap, Math.floor(earnMs / (s.minutesPerShard * 60000)));
     var w = load();
+    if (hasDueBank(w, app, day)) { releaseBanked(app); w = load(); }
     var have = eventsOn(w, app, day, function (e) { return e.kind === 'time'; });
     var got = 0;
     if (due > have) got = earn(app, 'time', due - have, s.minutesPerShard + ' minutes of learning', { tag: 'time' }).granted;
@@ -587,7 +757,8 @@
       lastTick = t;
       var visible = !doc || doc.visibilityState === undefined || doc.visibilityState === 'visible';
       var learning = typeof opts.isLearning === 'function' ? !!opts.isLearning() : true;
-      if (visible && learning && t - last <= settings().idleMs) tickActive(app, Math.min(dt, every * 2));
+      var rep = typeof opts.isRepeat === 'function' ? !!opts.isRepeat() : !!opts.repeat;
+      if (visible && learning && t - last <= settings().idleMs) tickActive(app, Math.min(dt, every * 2), { repeat: rep });
     };
     var id = (opts.setInterval || setInterval)(tick, every);
     return {
@@ -1258,6 +1429,7 @@
     inventory: inventory, owns: owns, buy: buy, equip: equip, setGoal: setGoal, equippedItems: equippedItems, affordable: affordable, goalProgress: goalProgress,
     names: names, onChange: onChange, dayKey: dayKey, weekStart: weekStart,
     registerApp: registerApp, isNew: function (app) { return isNew(app); },
+    MODULE_VERSION: MODULE_VERSION, earnOnce: earnOnce, rupeesOnce: rupeesOnce, releaseBanked: releaseBanked, policy: policy, daily: daily, bankedNow: bankedNow,
     appsInSet: function () { return settings().appsInSet.slice(); },
     _catalog: CATALOG,
   };
