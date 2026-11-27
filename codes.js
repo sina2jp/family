@@ -1,7 +1,9 @@
-/*! codes.js - reads the two private setup codes exactly the way the apps do (parsers copied from the apps' sources):
+/*! codes.js 1.1.1 - reads the two private setup codes exactly the way the apps do (parsers copied from the apps' sources):
  *   "MA1:" + base64 JSON = Math Arena school sync   -> mathArena.v3.schoolSync.v1
- *   "MQ1:" + base64 JSON = Music Quest piano lessons -> musicQuest.myLessons.v1
- * FamilyCodes.read(text) -> [{kind:'math'|'music', key, value(object), summary, error?}] */
+ *   "MQ1:" + base64 JSON = Music Quest piano lessons -> musicQuest.myLessons.v1 (schema music-quest/lessons@1 or @2)
+ * FamilyCodes.read(text) -> [{kind:'math'|'music', key, value(object), summary, error?}]
+ * 1.1.1: lessons@2 fields (teacher, method, nextLessons, partyPiece, pieces[].pieceNotes/spots/songId) are kept,
+ *        sanitized; a lessons@1 code gives exactly the same stored value as before. */
 (function (root) {
   'use strict';
   // ---- Math Arena (src/codex/sync.js) ----
@@ -159,11 +161,70 @@ function parseSync(code) {
     return { data: out, warnings: w };
   };
 
+  // ---- 1.1.1: keep the lessons@2 fields (Music Quest 2.0 README). The lessons@1 validation above runs unchanged;
+  // these fields are added only when the code has them, sanitized: strings <= 200 characters, lists <= 8 items,
+  // dates YYYY-MM-DD, song ids [a-z0-9_]. Music Quest normalizes them again when it reads the stored value.
+  var SCHEMA2 = 'music-quest/lessons@2', SONG_RE = /^[a-z0-9_]{1,60}$/;
+  function localDay(t) { var d = new Date(t); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function strList(a) { return a.map(function (t) { return str(t, 200); }).filter(Boolean).slice(0, 8); }
+  function dateList(a) {
+    var seen = {}, list = a.filter(function (d) { return isDate(d) && !seen[d] && (seen[d] = 1); }).sort();
+    if (list.length <= 8) return list;
+    var today = localDay(Date.now()), next = list.filter(function (d) { return d >= today; });
+    return next.length ? next.slice(0, 8) : list.slice(-8);
+  }
+  function spotList(a) {
+    return a.filter(function (c) { return Array.isArray(c) && c.length === 2 && isFinite(+c[0]) && isFinite(+c[1]) && +c[0] >= 1 && +c[1] >= +c[0] && +c[1] <= 400; })
+      .map(function (c) { return [Math.round(+c[0]), Math.round(+c[1])]; }).slice(0, 8);
+  }
+  function party(pp) {
+    if (typeof pp === 'string') return str(pp, 200) || null;
+    if (!pp || typeof pp !== 'object' || Array.isArray(pp)) return null;
+    var o = {}, t = str(pp.title, 200), id = str(pp.pieceId, 200), n = str(pp.name, 200);
+    if (t) o.title = t;
+    if (id) o.pieceId = id;
+    if (SONG_RE.test(String(pp.songId || ''))) o.songId = String(pp.songId);
+    if (isDate(pp.date)) o.date = pp.date;
+    if (n) o.name = n;
+    return o.title || o.pieceId ? o : null;
+  }
+  /** Add the lessons@2 fields of raw to data (the lessons@1 result). Returns data. */
+  L.keepV2 = function (raw, data) {
+    if (!raw || typeof raw !== 'object' || !data) return data;
+    var v2 = raw.schema === SCHEMA2 || !!raw.teacher || !!raw.method || (Array.isArray(raw.nextLessons) && raw.nextLessons.length > 0) || !!raw.partyPiece;
+    if (v2) data.schema = SCHEMA2;
+    var teacher = str(raw.teacher, 200), method = str(raw.method, 200), pp = party(raw.partyPiece);
+    if (teacher) data.teacher = teacher;
+    if (method) data.method = method;
+    if (Array.isArray(raw.nextLessons)) data.nextLessons = dateList(raw.nextLessons);
+    if (pp) data.partyPiece = pp;
+    // the pieces that the lessons@1 validation kept, in the same order (it skips non-objects and pieces without a title)
+    var src = (Array.isArray(raw.pieces) ? raw.pieces : []).slice(0, 20).filter(function (p) { return p && typeof p === 'object' && str(p.title, 80); });
+    (data.pieces || []).forEach(function (piece, i) {
+      var p = src[i];
+      if (!p) return;
+      if (Array.isArray(p.pieceNotes)) piece.pieceNotes = strList(p.pieceNotes);
+      if (Array.isArray(p.spots)) piece.spots = spotList(p.spots);
+      if (SONG_RE.test(String(p.songId || ''))) piece.songId = String(p.songId);
+    });
+    return data;
+  };
+  /** "teacher ✔ · next lesson Sat, Dec 5 · party piece <title>" for a stored lessons value ('' for a lessons@1 value). */
+  L.extras = function (d, now) {
+    if (!d || typeof d !== 'object') return '';
+    var bits = [], today = localDay(now == null ? Date.now() : now);
+    if (d.teacher) bits.push('teacher \u2714');
+    var next = (Array.isArray(d.nextLessons) ? d.nextLessons : []).filter(function (x) { return isDate(x) && x >= today; }).sort()[0];
+    if (next) { var q = next.split('-'); bits.push('next lesson ' + new Date(+q[0], +q[1] - 1, +q[2]).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })); }
+    var pp = d.partyPiece, title = typeof pp === 'string' ? pp : pp && (pp.title || (pp.pieceId && ((d.pieces || []).filter(function (x) { return x.id === pp.pieceId; })[0] || {}).title));
+    if (title) bits.push('party piece ' + title);
+    return bits.join(' \u00b7 ');
+  };
 
     return L;
   })();
   function summaryMath(d) { return (d.programs || []).length + ' classes, ' + (d.weeks || []).length + ' weeks, ' + (d.books || []).length + ' books'; }
-  function summaryMusic(d) { return (d.pieces || []).length + ' pieces, ' + (d.technique || []).length + ' technique items'; }
+  function summaryMusic(d) { var x = L.extras(d); return (d.pieces || []).length + ' pieces, ' + (d.technique || []).length + ' technique items' + (x ? ' \u00b7 ' + x : ''); }
   /** Find every MA1:/MQ1: code in a pasted text (or an #import= fragment) and read each one. */
   function read(text) {
     // Codes are one long base64 word. Mail apps sometimes wrap them, so long base64-only lines that follow are joined.
@@ -181,8 +242,11 @@ function parseSync(code) {
         out.push(r.ok ? { kind: 'math', key: 'mathArena.v3.schoolSync.v1', value: r.data, summary: summaryMath(r.data) } : { kind: 'math', error: r.error });
       } else {
         try {
-          var res = L.normalize(L.decode(code));
+          var raw = L.decode(code);
+          var res = L.normalize(raw);
+          L.keepV2(raw, res.data);
           res.data.importedAt = new Date().toISOString();
+          if (JSON.stringify(res.data).length > 290000) throw new Error('That lesson code is too big.');
           out.push({ kind: 'music', key: 'musicQuest.myLessons.v1', value: res.data, summary: summaryMusic(res.data), warnings: res.warnings });
         } catch (e) { out.push({ kind: 'music', error: e && e.message ? e.message : 'That lesson code could not be read.' }); }
       }

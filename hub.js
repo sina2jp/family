@@ -275,7 +275,7 @@
     return [h('p', { text: 'The two private codes stay private: an #import= link is read in this browser only (the part after # is never sent to a server) and is removed from the address bar right away.' }),
       h('ul.status', null,
         h('li', { text: a ? 'Math Arena school sync: ' + (a.programs || []).length + ' classes, ' + (a.weeks || []).length + ' weeks' + (a.importedAt ? ' · ' + when(a.importedAt) : '') : 'Math Arena school sync: not yet' }),
-        h('li', { text: b ? 'Music Quest lessons: ' + (b.pieces || []).length + ' pieces' + (b.importedAt ? ' · ' + when(b.importedAt) : '') : 'Music Quest lessons: not yet' })),
+        h('li', { text: b ? 'Music Quest lessons: ' + (b.pieces || []).length + ' pieces' + (Codes.music.extras(b) ? ' · ' + Codes.music.extras(b) : '') + (b.importedAt ? ' · ' + when(b.importedAt) : '') : 'Music Quest lessons: not yet', 'data-codes': 'music' })),
       ta,
       h('div.row', null, h('button.btn.primary', { text: 'Import codes', on: { click: function () { if (importCodes(ta.value)) { ui.open = 'codes'; } route(); } } }),
         !(a || b) ? h('button.btn.link', { text: 'Skip for now', on: { click: function () { setPref(function (p) { p.skipped.codes = true; }); ui.open = next('codes'); route(); } } }) : null),
@@ -451,7 +451,10 @@
   }
   function codesCard() {
     var ta = h('textarea.inp.codes', { rows: 2, placeholder: 'Paste new MA1:… / MQ1:… codes', 'aria-label': 'New setup codes' });
-    return h('div.card', { id: 'updatecodes' }, h('h3', { text: 'Update setup codes' }), h('p.small', { text: 'Paste new codes, or open an import link (…/family/#import=…) on this laptop.' }), ta,
+    var mq = readJSON('musicQuest.myLessons.v1'), mx = mq ? Codes.music.extras(mq) : '';
+    return h('div.card', { id: 'updatecodes' }, h('h3', { text: 'Update setup codes' }),
+      mq ? h('p.small', { 'data-codes': 'music', text: 'Music Quest lessons: ' + (mq.pieces || []).length + ' pieces' + (mx ? ' · ' + mx : '') + (mq.importedAt ? ' · ' + when(mq.importedAt) : '') }) : null,
+      h('p.small', { text: 'Paste new codes, or open an import link (…/family/#import=…) on this laptop.' }), ta,
       h('button.btn', { text: 'Import', on: { click: function () { importCodes(ta.value); route(); } } }), msgFor('codes'));
   }
   function saveDevMeta(fn) { var m = devMeta(); fn(m); m.v = 1; m.updatedAt = new Date().toISOString(); FS.setSetting(K.devices || 'familyApps.devices.v1', m); }
